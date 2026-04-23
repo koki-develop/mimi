@@ -1,0 +1,13 @@
+version: "1.0"
+
+defaults:
+  base_dir: ../worktrees/mimi
+
+hooks:
+  post_create:
+    - type: copy
+      from: transcribe/.claude
+      to: transcribe/.claude
+    - type: copy
+      from: app/.claude
+      to: app/.claude
