@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>me.koki.transcribe</string>
+    <key>CFBundleName</key>
+    <string>transcribe</string>
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>Required to transcribe system audio output.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Required to transcribe microphone input.</string>
+</dict>
+</plist>
