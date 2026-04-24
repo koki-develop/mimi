@@ -1,5 +1,7 @@
+mod summarizer;
+
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -13,17 +15,35 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
+use crate::summarizer::Segment;
+
 struct Recording {
     pid: u32,
     terminated: oneshot::Receiver<()>,
     tail_cancel: Arc<AtomicBool>,
     tail: JoinHandle<()>,
     output_path: PathBuf,
+    segments: Arc<Mutex<Vec<Segment>>>,
+    summarizer_cancel: Arc<AtomicBool>,
+    summarizer: JoinHandle<()>,
 }
 
-#[derive(Default)]
 struct AppState {
     recording: Mutex<Option<Recording>>,
+    current_session_id: Arc<AtomicU64>,
+    summarizer_config: Arc<summarizer::SummarizerConfig>,
+    summary_interval: Duration,
+}
+
+impl AppState {
+    fn new(cfg: summarizer::SummarizerConfig, summary_interval: Duration) -> Self {
+        Self {
+            recording: Mutex::new(None),
+            current_session_id: Arc::new(AtomicU64::new(0)),
+            summarizer_config: Arc::new(cfg),
+            summary_interval,
+        }
+    }
 }
 
 #[tauri::command]
@@ -35,11 +55,17 @@ async fn start_recording(app: AppHandle, state: State<'_, AppState>) -> Result<(
         }
     }
 
+    // ヘルスチェック (Ollama 疎通 + モデル存在) を sidecar spawn より先に
+    let cfg = state.summarizer_config.clone();
+    summarizer::health_check(&cfg).await?;
+
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|e| e.to_string())?
         .as_millis();
     let output_path = std::env::temp_dir().join(format!("mimi-{ts}.jsonl"));
+
+    let session_id: u64 = ts as u64;
 
     let sidecar = app
         .shell()
@@ -51,6 +77,9 @@ async fn start_recording(app: AppHandle, state: State<'_, AppState>) -> Result<(
         ]);
     let (mut rx, child) = sidecar.spawn().map_err(|e| format!("spawn failed: {e}"))?;
     let pid = child.pid();
+
+    // sidecar spawn 成功後に store する (spawn 失敗時に stale な値を残さないため)
+    state.current_session_id.store(session_id, std::sync::atomic::Ordering::Release);
 
     let (term_tx, term_rx) = oneshot::channel();
     let rx_app = app.clone();
@@ -75,17 +104,25 @@ async fn start_recording(app: AppHandle, state: State<'_, AppState>) -> Result<(
                     if let Some(tx) = term_tx.take() {
                         let _ = tx.send(());
                     }
-                    // stop_recording がまだ take していない(= sidecar が自力で死んだ)ケースでは
-                    // ここで tail / tmp / state の後片付けを行う。stop_recording が先行していた場合は
-                    // take() が None を返すだけなので no-op になる。
                     let state = rx_app.state::<AppState>();
                     let taken = {
                         let mut guard = state.recording.lock().unwrap();
                         guard.take()
                     };
                     if let Some(recording) = taken {
+                        // stop_recording と同順序のクリーンアップ (spec §5.1)
+                        // 1. summarizer_cancel 最初
+                        recording.summarizer_cancel.store(true, Ordering::Release);
+                        state.current_session_id.store(0, std::sync::atomic::Ordering::Release);
+                        // 2-3. SIGINT と terminated 待ちはこのパスでは不要
+                        // 4. tail の EOF ポーリング 1 サイクル分
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        // 5. tail cancel + await
                         recording.tail_cancel.store(true, Ordering::Release);
                         let _ = recording.tail.await;
+                        // 6. summarizer loop join
+                        let _ = recording.summarizer.await;
+                        // 7. remove_file
                         let _ = std::fs::remove_file(&recording.output_path);
                     }
                     break;
@@ -95,11 +132,40 @@ async fn start_recording(app: AppHandle, state: State<'_, AppState>) -> Result<(
         }
     });
 
+    let segments: Arc<Mutex<Vec<Segment>>> = Arc::new(Mutex::new(Vec::new()));
+
+    use summarizer::SummarizerState;
+
+    // tail
     let tail_cancel = Arc::new(AtomicBool::new(false));
     let tail_cancel_c = tail_cancel.clone();
     let app_handle = app.clone();
     let tail_path = output_path.clone();
-    let tail = tokio::spawn(async move { tail_file(tail_path, app_handle, tail_cancel_c).await });
+    let segments_for_tail = segments.clone();
+    let tail = tokio::spawn(async move {
+        tail_file(tail_path, app_handle, tail_cancel_c, segments_for_tail).await
+    });
+
+    // summarizer
+    let summarizer_state = Arc::new(SummarizerState::new(session_id));
+    let summarizer_cancel = Arc::new(AtomicBool::new(false));
+    let emitter: Arc<dyn summarizer::SummaryEmitter> = Arc::new(summarizer::TauriSummaryEmitter { app: app.clone() });
+    let segments_for_loop = segments.clone();
+    let cancel_for_loop = summarizer_cancel.clone();
+    let session_id_for_loop = state.current_session_id.clone();
+    let cfg_for_loop = cfg.as_ref().clone();
+    let summary_interval_for_loop = state.summary_interval;
+    let summarizer = tokio::spawn(async move {
+        summarizer::summarizer_loop(
+            segments_for_loop,
+            summarizer_state,
+            emitter,
+            cancel_for_loop,
+            session_id_for_loop,
+            cfg_for_loop,
+            summary_interval_for_loop,
+        ).await
+    });
 
     let mut guard = state.recording.lock().unwrap();
     *guard = Some(Recording {
@@ -108,6 +174,9 @@ async fn start_recording(app: AppHandle, state: State<'_, AppState>) -> Result<(
         tail_cancel,
         tail,
         output_path,
+        segments,
+        summarizer_cancel,
+        summarizer,
     });
     Ok(())
 }
@@ -118,7 +187,6 @@ async fn stop_recording(state: State<'_, AppState>) -> Result<(), String> {
         let mut guard = state.recording.lock().unwrap();
         guard.take()
     };
-    // rx タスクが自力停止時に先に take していることがある。その場合は no-op で成功扱い。
     let Some(recording) = recording else {
         return Ok(());
     };
@@ -128,24 +196,45 @@ async fn stop_recording(state: State<'_, AppState>) -> Result<(), String> {
         tail_cancel,
         tail,
         output_path,
+        segments: _segments,
+        summarizer_cancel,
+        summarizer,
     } = recording;
 
-    // SIGINT が失敗する(ESRCH 等、プロセスが既に死んでいる)ケースは許容して cleanup を進める
+    // 7 ステップ (spec §5.1):
+    // 1. summarizer_cancel 最初
+    summarizer_cancel.store(true, Ordering::Release);
+    state.current_session_id.store(0, std::sync::atomic::Ordering::Release);
+
+    // 2. SIGINT
     if let Err(e) = kill(Pid::from_raw(pid as i32), Signal::SIGINT) {
         eprintln!("[stop] SIGINT failed (process may have exited): {e}");
     } else {
+        // 3. terminated を最大 10 秒待つ
         let _ = tokio::time::timeout(Duration::from_secs(10), terminated).await;
     }
-    // tail の EOF ポーリング 1 サイクル分の余裕を持たせて最終行のドレインを確実にする
+
+    // 4. tail の EOF ポーリング 1 サイクル分
     tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // 5. tail_cancel + tail.await
     tail_cancel.store(true, Ordering::Release);
     let _ = tail.await;
 
+    // 6. summarizer.await (ループ task の join。子タスクは detached)
+    let _ = summarizer.await;
+
+    // 7. remove_file
     let _ = std::fs::remove_file(&output_path);
     Ok(())
 }
 
-async fn tail_file(path: PathBuf, app: AppHandle, cancel: Arc<AtomicBool>) {
+async fn tail_file(
+    path: PathBuf,
+    app: AppHandle,
+    cancel: Arc<AtomicBool>,
+    segments: Arc<Mutex<Vec<Segment>>>,
+) {
     // sidecar spawn と tail は並行起動するため、JSONLWriter がファイルを作るまでポーリング待機
     loop {
         if cancel.load(Ordering::Acquire) {
@@ -201,7 +290,21 @@ async fn tail_file(path: PathBuf, app: AppHandle, cancel: Arc<AtomicBool>) {
             match std::str::from_utf8(line_bytes) {
                 Ok(s) => match serde_json::from_str::<Value>(s) {
                     Ok(value) => {
-                        let _ = app.emit("transcribe://event", value);
+                        let _ = app.emit("transcribe://event", value.clone());
+                        if value.get("type").and_then(|t| t.as_str()) == Some("segment") {
+                            if let Some(data) = value.get("data") {
+                                let source = match data.get("source").and_then(|s| s.as_str()) {
+                                    Some("mic") => Some(summarizer::Source::Mic),
+                                    Some("system") => Some(summarizer::Source::System),
+                                    _ => None,
+                                };
+                                let text = data.get("text").and_then(|t| t.as_str()).map(|s| s.to_string());
+                                let timestamp = value.get("timestamp").and_then(|t| t.as_str()).map(|s| s.to_string());
+                                if let (Some(source), Some(text), Some(timestamp)) = (source, text, timestamp) {
+                                    segments.lock().unwrap().push(Segment { timestamp, source, text });
+                                }
+                            }
+                        }
                     }
                     Err(e) => {
                         eprintln!("[tail] json parse error: {e} line={s}");
@@ -217,10 +320,27 @@ async fn tail_file(path: PathBuf, app: AppHandle, cancel: Arc<AtomicBool>) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let host = std::env::var("MIMI_OLLAMA_HOST")
+        .unwrap_or_else(|_| "http://localhost:11434".to_string());
+    let model = std::env::var("MIMI_OLLAMA_MODEL")
+        .unwrap_or_else(|_| "qwen3:4b-instruct".to_string());
+    let summary_interval = {
+        let secs = std::env::var("MIMI_SUMMARY_INTERVAL_SECONDS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(30)
+            .max(10);  // clamp min to 10s
+        Duration::from_secs(secs)
+    };
+    let http = reqwest::Client::builder()
+        .build()
+        .expect("failed to build reqwest client");
+    let cfg = summarizer::SummarizerConfig::new(http, host, model);
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
-        .manage(AppState::default())
+        .manage(AppState::new(cfg, summary_interval))
         .invoke_handler(tauri::generate_handler![start_recording, stop_recording])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

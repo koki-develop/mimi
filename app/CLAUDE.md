@@ -15,6 +15,8 @@ Package manager is **bun**, not npm/yarn. Use the Makefile for anything that tou
 
 TypeScript is `strict` + `noUnusedLocals` + `noUnusedParameters` — unused imports/params are hard errors, not warnings.
 
+For cargo commands against the Tauri crate, pass `--manifest-path src-tauri/Cargo.toml` (e.g. `cargo check --manifest-path src-tauri/Cargo.toml`, `cargo test --manifest-path src-tauri/Cargo.toml`) instead of `cd src-tauri && cargo ...`. The compound form breaks Claude Code's per-subcommand permission matching and triggers an approval prompt every time.
+
 ## Architecture
 
 The app is a thin Tauri shell around the Swift `transcribe` CLI. There is **no in-process transcription logic** — Rust spawns the sidecar as a child process and streams its output to the frontend.
@@ -40,6 +42,17 @@ Key invariants in `src-tauri/src/lib.rs`:
 Frontend event handling (`src/App.tsx`):
 
 - `TranscribeEvent` is a discriminated union matching the Swift-side JSONL schema. The `switch` ends with `const _exhaustive: never = event` — when Swift adds a new event type, this deliberately fails `tsc` so the frontend can't silently drop events. Keep that pattern.
+
+## Summarizer
+
+While recording, `summarizer_loop` in `src-tauri/src/summarizer.rs` sends the transcript delta to Ollama `/api/chat` every 30 s (configurable via env var `MIMI_SUMMARY_INTERVAL_SECONDS`, clamped to ≥10 s) and emits the updated summary as `summary://event`.
+
+- Model: env var `MIMI_OLLAMA_MODEL` (default `qwen3:4b-instruct` — the thinking-free `Qwen3-4B-Instruct-2507`). Host: `MIMI_OLLAMA_HOST` (default `http://localhost:11434`).
+- `start_recording` health-checks Ollama via `/api/tags` **before** the sidecar spawns. If Ollama is unreachable or the model isn't pulled, recording fails outright (no sidecar started).
+- Concurrency is managed by `SummarizerState` (session_id / generation / running_count): max 2 in flight, a 3rd tick is dropped, late-completing out-of-order generations are discarded, and child tasks still running across a stop→start boundary are blocked by the `session_id == current_session_id` guard.
+- Rolling summary: each interval sends `previous_summary + segments since last tick`. On generation error, that interval's segments are not re-sent next round (MVP tradeoff — see §8 of the spec for the lift path).
+- The `SummaryEvent` payload is **flat** (`text` / `message` at the top level) — unlike the nested `TranscribeEvent { data: {...} }`. The `switch` in `App.tsx` ends with `const _exhaustive: never = event` to enforce exhaustiveness.
+- Full design: `docs/superpowers/specs/2026-04-24-recording-summarizer-design.md`.
 
 ## Sidecar bundling
 
