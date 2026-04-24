@@ -5,15 +5,13 @@ public enum AudioSource: String, Sendable, Codable {
     case system
 }
 
-public struct Segment: Sendable, Codable, Equatable {
-    public let type: String
+public struct Segment: Sendable, Equatable {
     public let source: AudioSource
     public let timestamp: Date
     public let duration: Double
     public let text: String
 
     public init(source: AudioSource, timestamp: Date, duration: Double, text: String) {
-        self.type = "segment"
         self.source = source
         self.timestamp = timestamp
         self.duration = duration
@@ -21,31 +19,8 @@ public struct Segment: Sendable, Codable, Equatable {
     }
 }
 
-public enum JSONLSerializer {
-    public static func encode<T: Encodable>(_ value: T) throws -> Data {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.withoutEscapingSlashes, .sortedKeys]
-        encoder.dateEncodingStrategy = .custom { date, encoder in
-            var container = encoder.singleValueContainer()
-            try container.encode(ISO8601Format.shared.string(from: date))
-        }
-        return try encoder.encode(value)
-    }
-
-    public static func decode<T: Decodable>(_ type: T.Type, from data: Data) throws -> T {
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .custom { decoder in
-            let container = try decoder.singleValueContainer()
-            let s = try container.decode(String.self)
-            guard let date = ISO8601Format.shared.date(from: s) else {
-                throw DecodingError.dataCorruptedError(in: container, debugDescription: "Invalid ISO8601 date: \(s)")
-            }
-            return date
-        }
-        return try decoder.decode(T.self, from: data)
-    }
-}
-
+/// ISO8601(fractional seconds + local TZ)の相互変換ヘルパ。
+/// `Event` の Codable 実装が JSONL の timestamp 表現として使用する。
 struct ISO8601Format: Sendable {
     static let shared = ISO8601Format()
 

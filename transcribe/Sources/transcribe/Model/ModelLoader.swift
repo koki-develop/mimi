@@ -18,13 +18,13 @@ public actor ModelLoader {
     public func load(
         name: String,
         computeOptions: ModelComputeOptions,
-        reporter: ConsoleReporter
+        reporter: EventLogger
     ) async throws -> LoadedModel {
         let shouldAnnounce = !announced
         announced = true
 
         if shouldAnnounce {
-            await reporter.reportStatus("Loading model (\(name))...")
+            await reporter.statusMessage("Loading model (\(name))...")
         }
         do {
             let config = WhisperKitConfig(
@@ -36,7 +36,7 @@ public actor ModelLoader {
             )
             let kit = try await WhisperKit(config)
             if shouldAnnounce {
-                await reporter.reportStatus("Ready.")
+                await reporter.statusMessage("Ready.")
             }
             return LoadedModel(name: name, kit: kit)
         } catch {

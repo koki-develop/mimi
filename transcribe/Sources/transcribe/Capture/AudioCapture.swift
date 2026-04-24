@@ -14,16 +14,24 @@ public actor AudioCapture {
 
     private let micContinuation: AsyncStream<CapturedAudioChunk>.Continuation
     private let systemContinuation: AsyncStream<CapturedAudioChunk>.Continuation
-    private let reporter: ConsoleReporter
+    private let reporter: EventLogger
     private let verbose: Bool
     private let sessionStart = SessionStartTracker()
+    private let streamErrorBox = StreamErrorBox()
 
     private var stream: SCStream?
     private var micOutput: OutputHandler?
     private var systemOutput: OutputHandler?
     private var delegate: Delegate?
 
-    public init(reporter: ConsoleReporter, verbose: Bool = false) {
+    /// Delegate が `SCStreamDelegate.stream(_:didStopWithError:)` を受けた際に記録した
+    /// エラーを取り出す(取り出し時にクリア)。consume が drain した後に App 側で
+    /// `error` イベントとして emit するために使う。
+    public nonisolated func takeStreamError() -> Error? {
+        streamErrorBox.take()
+    }
+
+    public init(reporter: EventLogger, verbose: Bool = false) {
         var micContinuation: AsyncStream<CapturedAudioChunk>.Continuation!
         var systemContinuation: AsyncStream<CapturedAudioChunk>.Continuation!
         self.micStream = AsyncStream(bufferingPolicy: .unbounded) { micContinuation = $0 }
@@ -86,7 +94,7 @@ public actor AudioCapture {
             sessionStart: sessionStart
         )
         let delegate = Delegate(
-            reporter: reporter,
+            streamErrorBox: streamErrorBox,
             micOutput: micOutput,
             systemOutput: systemOutput,
             micContinuation: micContinuation,
@@ -148,24 +156,45 @@ public actor AudioCapture {
         sessionStart.startedAt ?? Date()
     }
 
+    /// `SCStreamDelegate.stream(_:didStopWithError:)` で捕捉した最初のエラーを
+    /// 同期的に保存するためのロック付きストレージ。Delegate のコールバックは
+    /// actor 外の dispatch キューから呼ばれるため、actor hop を介さずに記録できる
+    /// 必要がある。
+    final class StreamErrorBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var error: Error?
+
+        func trySet(_ err: Error) {
+            lock.lock(); defer { lock.unlock() }
+            if error == nil { error = err }
+        }
+
+        func take() -> Error? {
+            lock.lock(); defer { lock.unlock() }
+            let taken = error
+            error = nil
+            return taken
+        }
+    }
+
     final class Delegate: NSObject, SCStreamDelegate, @unchecked Sendable {
-        private let reporter: ConsoleReporter
         private let micOutput: OutputHandler
         private let systemOutput: OutputHandler
         private let micContinuation: AsyncStream<CapturedAudioChunk>.Continuation
         private let systemContinuation: AsyncStream<CapturedAudioChunk>.Continuation
+        private let streamErrorBox: StreamErrorBox
 
         private let finishLock = NSLock()
         private var hasFinished = false
 
         init(
-            reporter: ConsoleReporter,
+            streamErrorBox: StreamErrorBox,
             micOutput: OutputHandler,
             systemOutput: OutputHandler,
             micContinuation: AsyncStream<CapturedAudioChunk>.Continuation,
             systemContinuation: AsyncStream<CapturedAudioChunk>.Continuation
         ) {
-            self.reporter = reporter
+            self.streamErrorBox = streamErrorBox
             self.micOutput = micOutput
             self.systemOutput = systemOutput
             self.micContinuation = micContinuation
@@ -173,9 +202,10 @@ public actor AudioCapture {
         }
 
         func stream(_ stream: SCStream, didStopWithError error: any Error) {
-            Task { [reporter] in
-                await reporter.reportError("Capture stopped unexpectedly: \(error)")
-            }
+            // エラーを同期的に box に保管し、App.run が group drain 後に取り出して
+            // `error` イベントを本流で emit する。fire-and-forget Task だと
+            // writer close との race で JSONL から event が消える可能性があるため。
+            streamErrorBox.trySet(error)
             finish()
         }
 
@@ -199,7 +229,7 @@ public actor AudioCapture {
 
         private let source: AudioSource
         private let continuation: AsyncStream<CapturedAudioChunk>.Continuation
-        private let reporter: ConsoleReporter
+        private let reporter: EventLogger
         private let verbose: Bool
         private let targetFormat: AVAudioFormat
         private let sessionStart: SessionStartTracker
@@ -210,7 +240,7 @@ public actor AudioCapture {
         init(
             source: AudioSource,
             continuation: AsyncStream<CapturedAudioChunk>.Continuation,
-            reporter: ConsoleReporter,
+            reporter: EventLogger,
             verbose: Bool,
             sessionStart: SessionStartTracker
         ) {
@@ -238,7 +268,7 @@ public actor AudioCapture {
 
             if let warning = result.warning {
                 Task { [reporter] in
-                    await reporter.reportWarning(warning)
+                    await reporter.warning(warning)
                 }
             }
             if let trailingChunk = result.chunk {
@@ -274,12 +304,12 @@ public actor AudioCapture {
 
             if let firstFormatLog = result.firstFormatLog {
                 Task { [reporter] in
-                    await reporter.reportStatus(firstFormatLog)
+                    await reporter.statusMessage(firstFormatLog)
                 }
             }
             if let warning = result.warning {
                 Task { [reporter] in
-                    await reporter.reportWarning(warning)
+                    await reporter.warning(warning)
                 }
             }
             if let drainedChunk = result.drainedChunk {

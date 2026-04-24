@@ -14,7 +14,7 @@ public actor Transcriber: TranscriberProtocol {
 
     private let source: AudioSource
     private let kit: WhisperKit
-    private let reporter: ConsoleReporter
+    private let reporter: EventLogger
     private let verbose: Bool
     private let vad: EnergyVAD
 
@@ -24,7 +24,7 @@ public actor Transcriber: TranscriberProtocol {
     public init(
         source: AudioSource,
         model: LoadedModel,
-        reporter: ConsoleReporter,
+        reporter: EventLogger,
         verbose: Bool = false
     ) {
         self.source = source
@@ -88,7 +88,7 @@ public actor Transcriber: TranscriberProtocol {
         if verbose {
             let rms = samples.isEmpty ? 0.0 : sqrt(samples.reduce(Float(0)) { $0 + $1 * $1 } / Float(samples.count))
             let label = source == .mic ? "mic" : "sys"
-            await reporter.reportStatus(String(
+            await reporter.statusMessage(String(
                 format: "[debug] %@ window=%d samples=%d rms=%.4f voice=%.1f%%",
                 label,
                 windowIndex,
@@ -128,8 +128,12 @@ public actor Transcriber: TranscriberProtocol {
                     ))
                 }
             }
+        } catch is CancellationError {
+            // シャットダウン経路で cancelAll() 経由に kit.transcribe がキャンセルされた場合は
+            // ノイズ(spurious warning flood)を避けるため silent に return する。
+            return
         } catch {
-            await reporter.reportWarning("transcription failed for \(source.rawValue): \(error)")
+            await reporter.warning("transcription failed for \(source.rawValue): \(error)")
         }
     }
 }
