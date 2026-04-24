@@ -1,7 +1,7 @@
 CLT_FRAMEWORKS = /Library/Developer/CommandLineTools/Library/Developer/Frameworks
 CLT_TESTING_LIB = /Library/Developer/CommandLineTools/Library/Developer/usr/lib
 
-.PHONY: build test run clean
+.PHONY: build test run clean fmt lint
 
 build:
 	swift build
@@ -26,3 +26,9 @@ run:
 
 clean:
 	swift package clean
+
+fmt:
+	swift format format --in-place --recursive Sources Tests
+
+lint:
+	swift format lint --strict --recursive Sources Tests

@@ -8,6 +8,7 @@ Use the Makefile, not raw `swift` — `make test` injects framework search paths
 
 - `make build` / `make test` / `make clean`
 - `make run ARGS="-o out.jsonl"` — `ARGS` is forwarded to `swift run transcribe`.
+- `make fmt` / `make lint` — `swift format` (Swift 6 toolchain built-in) against `Sources` + `Tests`. `lint` runs with `--strict` (warnings fail). No `.swift-format` config file; defaults are used.
 - Single test: `swift test --filter <Suite>.<Test>` (add the same `-Xswiftc -F …` flags the Makefile uses if CLT-only).
 
 Tests use **swift-testing** (`@Suite` / `@Test` / `#expect`), not XCTest.
