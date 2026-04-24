@@ -5,6 +5,8 @@ defaults:
 
 hooks:
   post_create:
+    - type: command
+      command: lefthook install
     - type: copy
       from: transcribe/.claude
       to: transcribe/.claude
