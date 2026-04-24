@@ -17,13 +17,9 @@ Tests use **swift-testing** (`@Suite` / `@Test` / `#expect`), not XCTest.
 
 macOS 15+, Swift 6.3 with `swiftLanguageModes: [.v6]` (strict concurrency). Dependencies (`WhisperKit`, `swift-argument-parser`) are imported with `@preconcurrency` where their types aren't `Sendable`-clean — follow that pattern.
 
-## Non-obvious things
+## Build quirks
 
-- **`Info.plist` is linker-injected**, not bundled. `Package.swift` uses `unsafeFlags` with `-sectcreate __TEXT __info_plist` because this is a plain SwiftPM executable, not an `.app`. The plist is `exclude`d from resources. `NSAudioCaptureUsageDescription` + `NSMicrophoneUsageDescription` are both required or the first permission prompt crashes.
-- **Two WhisperKit instances are loaded for the same model** in `App.run` — mic on `.cpuAndNeuralEngine`, system on `.cpuAndGPU`. This is intentional to avoid ANE contention when both streams decode concurrently; don't "dedupe" it.
-- **A single `SCStream` carries both mic and system audio.** It needs a dummy 2×2 @ 1fps video config even though no video output is registered — `SCStream` refuses audio-only setups.
-- **Transcription language is hard-coded to `"ja"`** in `Transcriber.swift` (`DecodingOptions.language`). Any multilingual support requires plumbing through `TranscribeCommand`.
-- **`JSONLWriter` refuses to overwrite existing files**; `App.run` also pre-checks. Preserve this — it's the user's crash-safety net.
+**`Info.plist` is linker-injected**, not bundled. `Package.swift` uses `unsafeFlags` with `-sectcreate __TEXT __info_plist` because this is a plain SwiftPM executable, not an `.app`. The plist is `exclude`d from resources. `NSAudioCaptureUsageDescription` + `NSMicrophoneUsageDescription` are both required or the first permission prompt crashes.
 
 ## Pipeline shape
 
