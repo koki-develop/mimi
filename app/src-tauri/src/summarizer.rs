@@ -1,7 +1,7 @@
-//! 録音中リアルタイム要約のパイプライン。
-//! モジュール構成は docs/superpowers/specs/2026-04-24-recording-summarizer-design.md を参照。
+//! 録音中のタイムライン要約のパイプライン。
+//! 設計: docs/superpowers/specs/2026-04-24-timeline-summarizer-design.md
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -30,6 +30,17 @@ pub struct Segment {
     pub text: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimelineEntry {
+    pub generation: u64,
+    /// 対象 segments の最初の timestamp (ISO8601)。
+    /// carry-over 発生時は前回失敗分の最古 segment の timestamp が入る (spec §4.1)。
+    pub range_start: String,
+    /// 対象 segments の最後の timestamp (ISO8601)。
+    pub range_end: String,
+    pub text: String,
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum SummaryError {
     #[error("HTTP status: {0}")]
@@ -54,19 +65,21 @@ fn escape_xml(s: &str) -> String {
 }
 
 const CHAT_TIMEOUT: Duration = Duration::from_secs(120);
-const MAX_CONCURRENT_SUMMARIES: u8 = 2;
 const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-const SYSTEM_PROMPT_INITIAL: &str = "会議の音声文字起こしを要約するタスクです。
+const SYSTEM_PROMPT_ENTRY: &str = "会議の音声文字起こしを一定時間ごとに要約するタスクです。タイムライン形式で、各エントリは短時間区間の発話をまとめたものです。
 
 入力:
-<transcript> タグ内に発話の時系列記録が与えられます。発話の表記:
+- <previous_entries> タグ内（省略される場合あり）: 直近の既存エントリ群（古い→新しい順、各行 `[HH:MM:SS] 本文`）
+- <transcript> タグ内: 今回の区間の発話の時系列記録
+
+発話の表記:
 - `[自分]` : 記録者本人の発話（マイク入力）
 - `[他者]` : それ以外の発話（1 人とは限らず、複数人が含まれる可能性があります）
 
 出力要件:
-- 日本語
-- 1 段落のみ。4〜6 文、全体で 200〜400 字程度
+- 今回の <transcript> 区間で起きた内容に焦点を絞って要約する（previous_entries はあくまで文脈参照用）
+- 日本語 1 段落、4〜6 文、全体で 200〜400 字程度
 - 会話の流れがわかる連文で書く（箇条書き禁止）
 - 発話内容に忠実に。記録にないことは書かない（推測・補完・創作禁止）
 - 「要約：」等の前置き、自己言及、メタ的コメントは書かない
@@ -86,38 +99,42 @@ fn format_segments(segments: &[Segment]) -> String {
         .join("\n")
 }
 
-pub fn build_initial_prompt(segments: &[Segment]) -> (&'static str, String) {
-    let body = format_segments(segments);
-    let user = if body.is_empty() {
-        "<transcript>\n</transcript>".to_string()
-    } else {
-        format!("<transcript>\n{body}\n</transcript>")
-    };
-    (SYSTEM_PROMPT_INITIAL, user)
+fn iso_to_hms(iso: &str) -> String {
+    use chrono::DateTime;
+    DateTime::parse_from_rfc3339(iso)
+        .map(|dt| dt.format("%H:%M:%S").to_string())
+        .unwrap_or_else(|e| {
+            eprintln!("[timeline] iso_to_hms: RFC3339 parse failed for {iso:?}: {e}");
+            iso.to_string()
+        })
 }
 
-const SYSTEM_PROMPT_UPDATE: &str = "会議の音声文字起こしを継続的に要約するタスクです。直前の要約を、新しく追加された発話の内容を取り込んだ最新版に更新します。
+fn format_previous_entries(entries: &[TimelineEntry]) -> String {
+    entries
+        .iter()
+        .map(|e| format!("[{}] {}", iso_to_hms(&e.range_start), escape_xml(&e.text)))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
-入力:
-- <previous_summary> タグ内: 直前時点までの要約
-- <transcript> タグ内: その後に追加された発話の時系列記録
-
-発話の表記:
-- `[自分]` : 記録者本人の発話（マイク入力）
-- `[他者]` : それ以外の発話（1 人とは限らず、複数人が含まれる可能性があります）
-
-更新ルール:
-- 直前の要約を土台として、新しい発話の内容を反映した「現時点までの流れ」を表す最新版を出力する
-- 古い情報が新しい発話で訂正・更新された場合は最新の状態を優先する
-- 議論が発展したときはその展開も反映する
-
-出力要件:
-- 日本語
-- 1 段落のみ。4〜6 文、全体で 200〜400 字程度
-- 会話の流れがわかる連文で書く（箇条書き禁止）
-- 発話内容に忠実に。記録にないことは書かない（推測・補完・創作禁止）
-- 「要約：」等の前置き、自己言及、メタ的コメントは書かない
-- 思考過程や下書きは書かず、完成した要約本文のみを出力する";
+pub fn build_entry_prompt(
+    prev_entries: &[TimelineEntry],
+    segments: &[Segment],
+) -> (&'static str, String) {
+    let transcript_body = format_segments(segments);
+    let transcript_block = if transcript_body.is_empty() {
+        "<transcript>\n</transcript>".to_string()
+    } else {
+        format!("<transcript>\n{transcript_body}\n</transcript>")
+    };
+    let user = if prev_entries.is_empty() {
+        transcript_block
+    } else {
+        let prev_body = format_previous_entries(prev_entries);
+        format!("<previous_entries>\n{prev_body}\n</previous_entries>\n\n{transcript_block}")
+    };
+    (SYSTEM_PROMPT_ENTRY, user)
+}
 
 #[derive(Serialize)]
 struct OllamaChatRequest<'a> {
@@ -154,14 +171,6 @@ struct ChatRequestOwned {
     user: String,
 }
 
-fn build_chat_request(model: &str, new_segments: &[Segment], prev: Option<&str>) -> ChatRequestOwned {
-    let (system, user) = match prev {
-        None => build_initial_prompt(new_segments),
-        Some(p) => build_update_prompt(p, new_segments),
-    };
-    ChatRequestOwned { model: model.to_string(), system, user }
-}
-
 impl Serialize for ChatRequestOwned {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         let req = OllamaChatRequest {
@@ -193,9 +202,14 @@ impl SummarizerConfig {
 pub async fn generate_summary(
     cfg: &SummarizerConfig,
     new_segments: &[Segment],
-    prev: Option<&str>,
+    prev_entries: &[TimelineEntry],
 ) -> Result<String, SummaryError> {
-    let body = build_chat_request(&cfg.model, new_segments, prev);
+    let (system, user) = build_entry_prompt(prev_entries, new_segments);
+    let body = ChatRequestOwned {
+        model: cfg.model.clone(),
+        system,
+        user,
+    };
     // Note: `e.is_timeout()` covers `RequestBuilder::timeout()` expiry (which we set above).
     // Connect-level timeouts from `ClientBuilder::connect_timeout` would arrive as
     // `is_connect()` and fall through to `Transport`. Acceptable for MVP.
@@ -253,106 +267,90 @@ pub async fn health_check(cfg: &SummarizerConfig) -> Result<(), String> {
     Ok(())
 }
 
-pub fn build_update_prompt(prev_summary: &str, segments: &[Segment]) -> (&'static str, String) {
-    let body = format_segments(segments);
-    let transcript = if body.is_empty() {
-        "<transcript>\n</transcript>".to_string()
-    } else {
-        format!("<transcript>\n{body}\n</transcript>")
-    };
-    let user = format!(
-        "<previous_summary>\n{}\n</previous_summary>\n\n{transcript}",
-        escape_xml(prev_summary)
-    );
-    (SYSTEM_PROMPT_UPDATE, user)
-}
-
 // ---------------------------------------------------------------------------
-// SummarizerState — concurrency admission
+// TimelineState — session scope + serial-execution gate (in_flight)
 // ---------------------------------------------------------------------------
 
-pub struct SummarizerState {
+pub struct TimelineState {
     pub session_id: u64,
-    generation: AtomicU64,
-    running_count: AtomicU8,
-    latest_displayed_gen: AtomicU64,
-    latest_summary: Mutex<Option<String>>,
+    pub current_generation: AtomicU64,
+    /// 「ここまでの segments は成功裏に要約済み」を示すポインタ。
+    /// **成功時のみ進める** (spec §4.1)。失敗時は進めず、次 tick で segments が合流する (carry-over)。
+    pub last_committed_end_index: AtomicUsize,
+    pub in_flight: AtomicBool,
+    pub entries: Mutex<Vec<TimelineEntry>>,
 }
 
-impl SummarizerState {
+impl TimelineState {
     pub fn new(session_id: u64) -> Self {
         Self {
             session_id,
-            generation: AtomicU64::new(0),
-            running_count: AtomicU8::new(0),
-            latest_displayed_gen: AtomicU64::new(0),
-            latest_summary: Mutex::new(None),
+            current_generation: AtomicU64::new(0),
+            last_committed_end_index: AtomicUsize::new(0),
+            in_flight: AtomicBool::new(false),
+            entries: Mutex::new(Vec::new()),
         }
-    }
-
-    /// CAS で最大 2 並列まで受け入れる。受け入れたら true、満員なら false。
-    pub fn try_admit(&self) -> bool {
-        self.running_count
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                if n < MAX_CONCURRENT_SUMMARIES { Some(n + 1) } else { None }
-            })
-            .is_ok()
-    }
-
-    pub fn release(&self) {
-        // spec §5.2.2 は `fetch_sub(1, Ordering::AcqRel)` を記述するが、
-        // running_count が 0 のときの `fetch_sub` は u8 の wrap で 255 になり
-        // 二度と admit できなくなる致命的バグを生む。MVP 実装では spec より厳格に
-        // CAS で saturating sub を採用する。
-        self.running_count
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                if n > 0 { Some(n - 1) } else { Some(0) }
-            })
-            .ok();
     }
 }
 
 // ---------------------------------------------------------------------------
-// SummaryEmitter — event emission trait
+// InFlightGuard — RAII release for TimelineState::in_flight
+// ---------------------------------------------------------------------------
+//
+// 直列ゲートの release を Drop に委ねることで、spawned task の panic
+// (mutex poisoning やアロケーション失敗など) で in_flight が永久 true に
+// なって以降の tick が全部スキップされる事故を防ぐ。
+// admit (swap(true)) 成功直後に生成し、empty-segments path では scope 終了で、
+// spawn 経由では task 終了時にそれぞれ自動解除される。
+struct InFlightGuard(Arc<TimelineState>);
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.in_flight.store(false, Ordering::Release);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TimelineEmitter — event emission trait
 // ---------------------------------------------------------------------------
 
-pub trait SummaryEmitter: Send + Sync + 'static {
+pub trait TimelineEmitter: Send + Sync + 'static {
     fn emit_generating(&self, session_id: u64, generation: u64);
-    fn emit_summary(&self, session_id: u64, generation: u64, text: &str);
+    fn emit_entry(&self, session_id: u64, entry: &TimelineEntry);
     fn emit_error(&self, session_id: u64, generation: u64, message: &str);
 }
 
 // ---------------------------------------------------------------------------
-// SummaryEventPayload — discriminated-union event types emitted to the frontend
+// TimelineEventPayload — discriminated-union event types emitted to the frontend
 // ---------------------------------------------------------------------------
 
 #[derive(Serialize, Clone)]
 #[serde(tag = "type", rename_all = "lowercase")]
-enum SummaryEventPayload<'a> {
+enum TimelineEventPayload<'a> {
     Generating { session_id: u64, generation: u64, timestamp: &'a str },
-    Summary { session_id: u64, generation: u64, timestamp: &'a str, text: &'a str },
+    Entry { session_id: u64, generation: u64, entry: &'a TimelineEntry },
     Error { session_id: u64, generation: u64, timestamp: &'a str, message: &'a str },
 }
 
-fn summary_event_generating(session_id: u64, generation: u64, ts: &str) -> SummaryEventPayload<'_> {
-    SummaryEventPayload::Generating { session_id, generation, timestamp: ts }
+fn timeline_event_generating(session_id: u64, generation: u64, ts: &str) -> TimelineEventPayload<'_> {
+    TimelineEventPayload::Generating { session_id, generation, timestamp: ts }
 }
-fn summary_event_summary<'a>(session_id: u64, generation: u64, ts: &'a str, text: &'a str) -> SummaryEventPayload<'a> {
-    SummaryEventPayload::Summary { session_id, generation, timestamp: ts, text }
+fn timeline_event_entry<'a>(session_id: u64, entry: &'a TimelineEntry) -> TimelineEventPayload<'a> {
+    TimelineEventPayload::Entry { session_id, generation: entry.generation, entry }
 }
-fn summary_event_error<'a>(session_id: u64, generation: u64, ts: &'a str, message: &'a str) -> SummaryEventPayload<'a> {
-    SummaryEventPayload::Error { session_id, generation, timestamp: ts, message }
+fn timeline_event_error<'a>(session_id: u64, generation: u64, ts: &'a str, message: &'a str) -> TimelineEventPayload<'a> {
+    TimelineEventPayload::Error { session_id, generation, timestamp: ts, message }
 }
 
 // ---------------------------------------------------------------------------
-// TauriSummaryEmitter — emits summary events to the Tauri frontend
+// TauriTimelineEmitter — emits timeline events to the Tauri frontend
 // ---------------------------------------------------------------------------
 
-pub struct TauriSummaryEmitter {
+pub struct TauriTimelineEmitter {
     pub app: AppHandle,
 }
 
-impl TauriSummaryEmitter {
+impl TauriTimelineEmitter {
     fn now_iso() -> String {
         use chrono::{DateTime, Local, Utc};
         let now = std::time::SystemTime::now()
@@ -365,18 +363,32 @@ impl TauriSummaryEmitter {
     }
 }
 
-impl SummaryEmitter for TauriSummaryEmitter {
+impl TimelineEmitter for TauriTimelineEmitter {
     fn emit_generating(&self, session_id: u64, generation: u64) {
         let ts = Self::now_iso();
-        let _ = self.app.emit("summary://event", summary_event_generating(session_id, generation, &ts));
+        if let Err(e) = self
+            .app
+            .emit("timeline://event", timeline_event_generating(session_id, generation, &ts))
+        {
+            eprintln!("[timeline] emit generating failed (gen={generation}): {e}");
+        }
     }
-    fn emit_summary(&self, session_id: u64, generation: u64, text: &str) {
-        let ts = Self::now_iso();
-        let _ = self.app.emit("summary://event", summary_event_summary(session_id, generation, &ts, text));
+    fn emit_entry(&self, session_id: u64, entry: &TimelineEntry) {
+        if let Err(e) = self
+            .app
+            .emit("timeline://event", timeline_event_entry(session_id, entry))
+        {
+            eprintln!("[timeline] emit entry failed (gen={}): {e}", entry.generation);
+        }
     }
     fn emit_error(&self, session_id: u64, generation: u64, message: &str) {
         let ts = Self::now_iso();
-        let _ = self.app.emit("summary://event", summary_event_error(session_id, generation, &ts, message));
+        if let Err(e) = self
+            .app
+            .emit("timeline://event", timeline_event_error(session_id, generation, &ts, message))
+        {
+            eprintln!("[timeline] emit error failed (gen={generation}, message={message:?}): {e}");
+        }
     }
 }
 
@@ -392,22 +404,22 @@ pub async fn wait_for_cancel(cancel: &Arc<AtomicBool>) {
 }
 
 // ---------------------------------------------------------------------------
-// summarizer_loop — main periodic summarization loop
+// timeline_loop — main periodic timeline-entry generation loop
 // ---------------------------------------------------------------------------
 
-pub async fn summarizer_loop(
+#[allow(clippy::too_many_arguments)]
+pub async fn timeline_loop(
     segments: Arc<Mutex<Vec<Segment>>>,
-    state: Arc<SummarizerState>,
-    emitter: Arc<dyn SummaryEmitter>,
+    state: Arc<TimelineState>,
+    emitter: Arc<dyn TimelineEmitter>,
     cancel: Arc<AtomicBool>,
     current_session_id: Arc<AtomicU64>,
     config: SummarizerConfig,
     tick_interval: Duration,
+    context_window: usize,
 ) {
     let mut ticker = tokio::time::interval(tick_interval);
     ticker.tick().await; // 初回即時発火を捨てる
-
-    let mut last_tried_end_index: usize = 0;
 
     loop {
         tokio::select! {
@@ -416,52 +428,68 @@ pub async fn summarizer_loop(
         }
         if cancel.load(Ordering::Acquire) { return; }
 
-        // 新規 segment 切り出し
-        let (new_segments, tried_end_index) = {
-            let lock = segments.lock().unwrap();
-            if lock.len() == last_tried_end_index {
-                continue;
-            }
-            let slice = lock[last_tried_end_index..].to_vec();
-            (slice, lock.len())
-        };
-        last_tried_end_index = tried_end_index;
-
-        if !state.try_admit() {
+        // 直列ゲート: 前回生成がまだ走っているならスキップ
+        // （segments は累積しているので次 tick で合流）
+        if state.in_flight.swap(true, Ordering::AcqRel) {
             continue;
         }
+        // この guard が生きている限り in_flight = true。Drop 時に自動 release。
+        // empty-segments で continue するパス、spawn に move するパス、spawn 内で panic した場合
+        // のいずれでも確実に解除される。
+        let guard = InFlightGuard(state.clone());
 
-        let gen = state.generation.fetch_add(1, Ordering::AcqRel) + 1;
-        let prev = state.latest_summary.lock().unwrap().clone();
-        emitter.emit_generating(state.session_id, gen);
+        // 新規 segment 切り出し
+        let end_index = {
+            let lock = segments.lock().unwrap();
+            lock.len()
+        };
+        let start_index = state.last_committed_end_index.load(Ordering::Acquire);
+        if end_index <= start_index {
+            // guard が scope 終了で drop → in_flight release
+            continue;
+        }
+        let new_segments: Vec<Segment> = {
+            let lock = segments.lock().unwrap();
+            lock[start_index..end_index].to_vec()
+        };
+        // 直前の空チェックで new_segments が空にならないことが保証されている
+        let range_start = new_segments.first().unwrap().timestamp.clone();
+        let range_end = new_segments.last().unwrap().timestamp.clone();
+
+        let generation = state.current_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let prev_entries: Vec<TimelineEntry> = {
+            let lock = state.entries.lock().unwrap();
+            let n = lock.len();
+            let take_from = n.saturating_sub(context_window);
+            lock[take_from..].to_vec()
+        };
+
+        emitter.emit_generating(state.session_id, generation);
 
         let state_c = state.clone();
         let emitter_c = emitter.clone();
         let cfg_c = config.clone();
         let current_session_id_c = current_session_id.clone();
         tokio::spawn(async move {
-            let result = generate_summary(&cfg_c, &new_segments, prev.as_deref()).await;
+            // guard を task に move。task 完了 or panic で Drop → in_flight release。
+            let _guard = guard;
+            let result = generate_summary(&cfg_c, &new_segments, &prev_entries).await;
 
             if current_session_id_c.load(Ordering::Acquire) != state_c.session_id {
-                state_c.release();
                 return;
             }
 
             match result {
                 Ok(text) => {
-                    if gen <= state_c.latest_displayed_gen.load(Ordering::Acquire) {
-                        state_c.release();
-                        return;
-                    }
-                    state_c.latest_displayed_gen.store(gen, Ordering::Release);
-                    *state_c.latest_summary.lock().unwrap() = Some(text.clone());
-                    emitter_c.emit_summary(state_c.session_id, gen, &text);
+                    let entry = TimelineEntry { generation, range_start, range_end, text };
+                    state_c.entries.lock().unwrap().push(entry.clone());
+                    state_c.last_committed_end_index.store(end_index, Ordering::Release);
+                    emitter_c.emit_entry(state_c.session_id, &entry);
                 }
                 Err(e) => {
-                    emitter_c.emit_error(state_c.session_id, gen, &e.to_string());
+                    emitter_c.emit_error(state_c.session_id, generation, &e.to_string());
                 }
             }
-            state_c.release();
         });
     }
 }
@@ -469,37 +497,40 @@ pub async fn summarizer_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use wiremock::{MockServer, Mock, ResponseTemplate};
     use wiremock::matchers::{method, path};
 
     // ---------------------------------------------------------------------------
-    // MockEmitter for testing
+    // MockTimelineEmitter for testing
     // ---------------------------------------------------------------------------
 
     #[derive(Debug, Clone)]
-    pub enum EmittedEvent {
+    pub enum EmittedTimelineEvent {
         Generating { session_id: u64, generation: u64 },
-        Summary { session_id: u64, generation: u64, text: String },
+        Entry { session_id: u64, entry: TimelineEntry },
         Error { session_id: u64, generation: u64, message: String },
     }
 
     #[derive(Default)]
-    pub struct MockEmitter {
-        pub calls: Mutex<Vec<EmittedEvent>>,
+    pub struct MockTimelineEmitter {
+        pub calls: Mutex<Vec<EmittedTimelineEvent>>,
     }
 
-    impl SummaryEmitter for MockEmitter {
+    impl TimelineEmitter for MockTimelineEmitter {
         fn emit_generating(&self, session_id: u64, generation: u64) {
-            self.calls.lock().unwrap().push(EmittedEvent::Generating { session_id, generation });
+            self.calls.lock().unwrap().push(EmittedTimelineEvent::Generating { session_id, generation });
         }
-        fn emit_summary(&self, session_id: u64, generation: u64, text: &str) {
-            self.calls.lock().unwrap().push(EmittedEvent::Summary { session_id, generation, text: text.to_string() });
+        fn emit_entry(&self, session_id: u64, entry: &TimelineEntry) {
+            self.calls.lock().unwrap().push(EmittedTimelineEvent::Entry { session_id, entry: entry.clone() });
         }
         fn emit_error(&self, session_id: u64, generation: u64, message: &str) {
-            self.calls.lock().unwrap().push(EmittedEvent::Error { session_id, generation, message: message.to_string() });
+            self.calls.lock().unwrap().push(EmittedTimelineEvent::Error { session_id, generation, message: message.to_string() });
         }
     }
+
+    // ---------------------------------------------------------------------------
+    // SummaryError
+    // ---------------------------------------------------------------------------
 
     #[test]
     fn summary_error_http_displays_status() {
@@ -512,6 +543,10 @@ mod tests {
         let err = SummaryError::Parse("boom".into());
         assert_eq!(format!("{err}"), "response parse failed: boom");
     }
+
+    // ---------------------------------------------------------------------------
+    // escape_xml
+    // ---------------------------------------------------------------------------
 
     #[test]
     fn escape_xml_replaces_angle_brackets() {
@@ -532,93 +567,68 @@ mod tests {
         assert_eq!(escape_xml("日本語は<そのまま>"), "日本語は&lt;そのまま&gt;");
     }
 
+    // ---------------------------------------------------------------------------
+    // build_entry_prompt
+    // ---------------------------------------------------------------------------
+
     #[test]
-    fn build_initial_prompt_wraps_segments_in_transcript_tags() {
+    fn build_entry_prompt_without_previous_entries_omits_tag() {
         let segments = vec![
-            Segment { timestamp: "t1".into(), source: Source::Mic, text: "こんにちは".into() },
-            Segment { timestamp: "t2".into(), source: Source::System, text: "はい<どうぞ>".into() },
+            Segment { timestamp: "2026-04-24T10:00:00.000+09:00".into(), source: Source::Mic, text: "よろしく".into() },
         ];
-        let (system, user) = build_initial_prompt(&segments);
-
-        assert!(system.contains("<transcript> タグ内"), "system prompt should describe <transcript> tag");
-        assert!(system.contains("[自分]"), "system prompt should mention [自分]");
-        assert!(system.contains("[他者]"), "system prompt should mention [他者]");
-        assert!(!system.contains("<previous_summary>"), "initial prompt must not reference previous_summary");
-
+        let (system, user) = build_entry_prompt(&[], &segments);
+        assert!(system.contains("<transcript>"), "system prompt must describe <transcript>");
         assert_eq!(
             user,
-            "<transcript>\n[自分] こんにちは\n[他者] はい&lt;どうぞ&gt;\n</transcript>"
+            "<transcript>\n[自分] よろしく\n</transcript>"
         );
     }
 
     #[test]
-    fn build_initial_prompt_handles_empty_segments() {
-        let (_, user) = build_initial_prompt(&[]);
-        assert_eq!(user, "<transcript>\n</transcript>");
-    }
-
-    #[test]
-    fn build_update_prompt_includes_previous_summary_and_new_segments() {
-        let segments = vec![
-            Segment { timestamp: "t3".into(), source: Source::Mic, text: "進捗を共有します".into() },
+    fn build_entry_prompt_with_previous_entries_includes_them_in_order() {
+        let prev = vec![
+            TimelineEntry {
+                generation: 1,
+                range_start: "2026-04-24T10:00:00.000+09:00".into(),
+                range_end: "2026-04-24T10:00:30.000+09:00".into(),
+                text: "最初の話題について軽く触れた。".into(),
+            },
+            TimelineEntry {
+                generation: 2,
+                range_start: "2026-04-24T10:00:30.000+09:00".into(),
+                range_end: "2026-04-24T10:01:00.000+09:00".into(),
+                text: "次の話題に移り議論を深めた。".into(),
+            },
         ];
-        let (system, user) = build_update_prompt("これまでの要約本文", &segments);
-
-        assert!(system.contains("<previous_summary>"), "update prompt should mention previous_summary");
-        assert!(system.contains("<transcript>"), "update prompt should mention transcript");
-        assert!(system.contains("更新ルール"), "update prompt should contain update rules");
+        let segments = vec![
+            Segment { timestamp: "2026-04-24T10:01:00.000+09:00".into(), source: Source::System, text: "続き<とか>".into() },
+        ];
+        let (_, user) = build_entry_prompt(&prev, &segments);
 
         assert_eq!(
             user,
-            "<previous_summary>\nこれまでの要約本文\n</previous_summary>\n\n<transcript>\n[自分] 進捗を共有します\n</transcript>"
+            "<previous_entries>\n[10:00:00] 最初の話題について軽く触れた。\n[10:00:30] 次の話題に移り議論を深めた。\n</previous_entries>\n\n<transcript>\n[他者] 続き&lt;とか&gt;\n</transcript>"
         );
     }
 
     #[test]
-    fn build_update_prompt_escapes_previous_summary_brackets() {
-        let (_, user) = build_update_prompt("要<約>", &[]);
-        assert!(user.contains("要&lt;約&gt;"), "previous summary must be xml-escaped");
-    }
-
-    // Task 8 tests
-    #[test]
-    fn build_chat_request_initial_has_expected_shape() {
-        let segments = vec![
-            Segment { timestamp: "t1".into(), source: Source::Mic, text: "テスト".into() },
+    fn build_entry_prompt_escapes_previous_entry_text() {
+        let prev = vec![
+            TimelineEntry {
+                generation: 1,
+                range_start: "2026-04-24T10:00:00.000+09:00".into(),
+                range_end: "2026-04-24T10:00:30.000+09:00".into(),
+                text: "A<B>&C".into(),
+            },
         ];
-        let body = build_chat_request("qwen3:4b", &segments, None);
-        let json = serde_json::to_value(&body).unwrap();
-
-        assert_eq!(json["model"], "qwen3:4b");
-        assert_eq!(json["stream"], false);
-        assert_eq!(json["options"]["temperature"], 0.3);
-        assert!(json.get("think").is_none(), "think should not be sent anymore");
-        assert!(json["options"].get("stop").is_none(), "stop tokens should not be sent anymore");
-
-        let messages = json["messages"].as_array().unwrap();
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0]["role"], "system");
-        assert!(messages[0]["content"].as_str().unwrap().contains("<transcript>"));
-        assert!(!messages[0]["content"].as_str().unwrap().contains("<previous_summary>"));
-        assert_eq!(messages[1]["role"], "user");
-        assert!(messages[1]["content"].as_str().unwrap().contains("[自分] テスト"));
+        let (_, user) = build_entry_prompt(&prev, &[]);
+        assert!(user.contains("A&lt;B&gt;&amp;C"), "previous entry text must be xml-escaped, got: {user}");
     }
 
-    #[test]
-    fn build_chat_request_update_uses_update_system_prompt_and_includes_previous_summary() {
-        let segments = vec![
-            Segment { timestamp: "t2".into(), source: Source::System, text: "続き".into() },
-        ];
-        let body = build_chat_request("qwen3:4b", &segments, Some("前回の要約"));
-        let json = serde_json::to_value(&body).unwrap();
+    // ---------------------------------------------------------------------------
+    // generate_summary
+    // ---------------------------------------------------------------------------
 
-        let messages = json["messages"].as_array().unwrap();
-        assert!(messages[0]["content"].as_str().unwrap().contains("<previous_summary>"));
-        assert!(messages[1]["content"].as_str().unwrap().contains("<previous_summary>\n前回の要約"));
-        assert!(messages[1]["content"].as_str().unwrap().contains("[他者] 続き"));
-    }
-
-    // Task 9 tests
     #[tokio::test]
     async fn generate_summary_returns_message_content_on_200() {
         let server = MockServer::start().await;
@@ -636,11 +646,58 @@ mod tests {
         let cfg = SummarizerConfig::new(reqwest::Client::new(), server.uri(), "qwen3:4b".into());
         let segments = vec![Segment { timestamp: "t".into(), source: Source::Mic, text: "hi".into() }];
 
-        let out = generate_summary(&cfg, &segments, None).await.unwrap();
+        let out = generate_summary(&cfg, &segments, &[]).await.unwrap();
         assert_eq!(out, "要約本文です。");
     }
 
-    // Task 10 tests
+    #[tokio::test]
+    async fn generate_summary_calls_api_chat_with_entry_prompt_when_prev_empty() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "message": { "role": "assistant", "content": "今日は会議が始まった。" }
+            })))
+            .mount(&server)
+            .await;
+
+        let cfg = SummarizerConfig::new(reqwest::Client::new(), server.uri(), "qwen3:4b".into());
+        let segments = vec![Segment { timestamp: "2026-04-24T10:00:00.000+09:00".into(), source: Source::Mic, text: "はい".into() }];
+        let out = generate_summary(&cfg, &segments, &[]).await.unwrap();
+        assert_eq!(out, "今日は会議が始まった。");
+    }
+
+    #[tokio::test]
+    async fn generate_summary_serializes_previous_entries_in_user_message() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "message": { "role": "assistant", "content": "OK" }
+            })))
+            .mount(&server)
+            .await;
+
+        let cfg = SummarizerConfig::new(reqwest::Client::new(), server.uri(), "qwen3:4b".into());
+        let prev = vec![TimelineEntry {
+            generation: 1,
+            range_start: "2026-04-24T10:00:00.000+09:00".into(),
+            range_end: "2026-04-24T10:00:30.000+09:00".into(),
+            text: "ぜんかい".into(),
+        }];
+        let segments = vec![Segment { timestamp: "2026-04-24T10:00:30.000+09:00".into(), source: Source::Mic, text: "こんかい".into() }];
+        let _ = generate_summary(&cfg, &segments, &prev).await.unwrap();
+
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+        let user_msg = body["messages"][1]["content"].as_str().unwrap();
+        assert!(user_msg.contains("<previous_entries>"), "user msg: {user_msg}");
+        assert!(user_msg.contains("[10:00:00] ぜんかい"));
+        assert!(user_msg.contains("<transcript>"));
+        assert!(user_msg.contains("[自分] こんかい"));
+    }
+
     #[tokio::test]
     async fn generate_summary_returns_http_error_on_500() {
         let server = MockServer::start().await;
@@ -651,7 +708,7 @@ mod tests {
             .await;
 
         let cfg = SummarizerConfig::new(reqwest::Client::new(), server.uri(), "x".into());
-        let err = generate_summary(&cfg, &[], None).await.unwrap_err();
+        let err = generate_summary(&cfg, &[], &[]).await.unwrap_err();
         assert!(matches!(err, SummaryError::Http(s) if s.as_u16() == 500), "got {err:?}");
     }
 
@@ -665,7 +722,7 @@ mod tests {
             .await;
 
         let cfg = SummarizerConfig::new(reqwest::Client::new(), server.uri(), "x".into());
-        let err = generate_summary(&cfg, &[], None).await.unwrap_err();
+        let err = generate_summary(&cfg, &[], &[]).await.unwrap_err();
         assert!(matches!(err, SummaryError::Http(s) if s.as_u16() == 404));
     }
 
@@ -679,21 +736,24 @@ mod tests {
             .await;
 
         let cfg = SummarizerConfig::new(reqwest::Client::new(), server.uri(), "x".into());
-        let err = generate_summary(&cfg, &[], None).await.unwrap_err();
+        let err = generate_summary(&cfg, &[], &[]).await.unwrap_err();
         assert!(matches!(err, SummaryError::Parse(_)), "got {err:?}");
     }
 
     #[tokio::test]
     async fn generate_summary_returns_transport_error_on_unreachable_host() {
         let cfg = SummarizerConfig::new(reqwest::Client::new(), "http://127.0.0.1:1".into(), "x".into());
-        let err = generate_summary(&cfg, &[], None).await.unwrap_err();
+        let err = generate_summary(&cfg, &[], &[]).await.unwrap_err();
         assert!(
             matches!(err, SummaryError::Transport(_) | SummaryError::Timeout(_)),
             "got {err:?}"
         );
     }
 
-    // Task 11 test
+    // ---------------------------------------------------------------------------
+    // health_check
+    // ---------------------------------------------------------------------------
+
     #[tokio::test]
     async fn health_check_succeeds_when_exact_model_name_is_present() {
         let server = MockServer::start().await;
@@ -712,7 +772,6 @@ mod tests {
         health_check(&cfg).await.expect("should pass");
     }
 
-    // Task 12 tests
     #[tokio::test]
     async fn health_check_fails_when_model_is_missing() {
         let server = MockServer::start().await;
@@ -771,57 +830,75 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Task 13: SummarizerState tests
+    // TimelineState
     // ---------------------------------------------------------------------------
 
     #[test]
-    fn summarizer_state_new_initializes_defaults() {
-        let s = SummarizerState::new(42);
+    fn timeline_state_new_initializes_defaults() {
+        let s = TimelineState::new(42);
         assert_eq!(s.session_id, 42);
-        assert_eq!(s.generation.load(Ordering::Acquire), 0);
-        assert_eq!(s.running_count.load(Ordering::Acquire), 0);
-        assert_eq!(s.latest_displayed_gen.load(Ordering::Acquire), 0);
-        assert!(s.latest_summary.lock().unwrap().is_none());
-    }
-
-    #[test]
-    fn try_admit_succeeds_up_to_two_and_fails_on_third() {
-        let s = SummarizerState::new(1);
-        assert!(s.try_admit(), "1st admit should succeed");
-        assert!(s.try_admit(), "2nd admit should succeed");
-        assert!(!s.try_admit(), "3rd admit should fail");
-        s.release();
-        assert!(s.try_admit(), "after release, 3rd admit should succeed");
-    }
-
-    #[test]
-    fn release_does_not_go_below_zero() {
-        let s = SummarizerState::new(1);
-        s.release();
-        assert_eq!(s.running_count.load(Ordering::Acquire), 0,
-            "release on zero-count should saturate at 0");
+        assert_eq!(s.current_generation.load(Ordering::Acquire), 0);
+        assert_eq!(s.last_committed_end_index.load(Ordering::Acquire), 0);
+        assert!(!s.in_flight.load(Ordering::Acquire));
+        assert!(s.entries.lock().unwrap().is_empty());
     }
 
     // ---------------------------------------------------------------------------
-    // Task 14: MockEmitter test
+    // TimelineEventPayload serialization
     // ---------------------------------------------------------------------------
 
     #[test]
-    fn mock_emitter_records_calls_in_order() {
-        let m = Arc::new(MockEmitter::default());
+    fn timeline_event_payloads_serialize_as_discriminated_union() {
+        let gen_json = serde_json::to_value(timeline_event_generating(100, 5, "2026-04-24T10:00:00.000+09:00")).unwrap();
+        assert_eq!(gen_json["type"], "generating");
+        assert_eq!(gen_json["session_id"], 100);
+        assert_eq!(gen_json["generation"], 5);
+        assert_eq!(gen_json["timestamp"], "2026-04-24T10:00:00.000+09:00");
+
+        let entry = TimelineEntry {
+            generation: 5,
+            range_start: "2026-04-24T10:00:00.000+09:00".into(),
+            range_end: "2026-04-24T10:00:30.000+09:00".into(),
+            text: "本文".into(),
+        };
+        let entry_json = serde_json::to_value(timeline_event_entry(100, &entry)).unwrap();
+        assert_eq!(entry_json["type"], "entry");
+        assert_eq!(entry_json["session_id"], 100);
+        assert_eq!(entry_json["generation"], 5);
+        assert_eq!(entry_json["entry"]["text"], "本文");
+        assert_eq!(entry_json["entry"]["range_start"], "2026-04-24T10:00:00.000+09:00");
+
+        let err_json = serde_json::to_value(timeline_event_error(100, 5, "2026-04-24T10:00:00.000+09:00", "爆発")).unwrap();
+        assert_eq!(err_json["type"], "error");
+        assert_eq!(err_json["message"], "爆発");
+    }
+
+    // ---------------------------------------------------------------------------
+    // MockTimelineEmitter
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn mock_timeline_emitter_records_calls_in_order() {
+        let m = Arc::new(MockTimelineEmitter::default());
         m.emit_generating(10, 1);
-        m.emit_summary(10, 1, "hello");
+        let e = TimelineEntry {
+            generation: 1,
+            range_start: "t0".into(),
+            range_end: "t1".into(),
+            text: "hello".into(),
+        };
+        m.emit_entry(10, &e);
         m.emit_error(10, 2, "err");
 
         let calls = m.calls.lock().unwrap().clone();
         assert_eq!(calls.len(), 3);
-        assert!(matches!(calls[0], EmittedEvent::Generating { session_id: 10, generation: 1 }));
-        assert!(matches!(&calls[1], EmittedEvent::Summary { session_id: 10, generation: 1, text } if text == "hello"));
-        assert!(matches!(&calls[2], EmittedEvent::Error { session_id: 10, generation: 2, message } if message == "err"));
+        assert!(matches!(calls[0], EmittedTimelineEvent::Generating { session_id: 10, generation: 1 }));
+        assert!(matches!(&calls[1], EmittedTimelineEvent::Entry { session_id: 10, entry } if entry.text == "hello"));
+        assert!(matches!(&calls[2], EmittedTimelineEvent::Error { session_id: 10, generation: 2, message } if message == "err"));
     }
 
     // ---------------------------------------------------------------------------
-    // Task 15: wait_for_cancel tests
+    // wait_for_cancel
     // ---------------------------------------------------------------------------
 
     #[tokio::test]
@@ -850,37 +927,33 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Task 16: summarizer_loop exits on cancel
+    // timeline_loop
     // ---------------------------------------------------------------------------
 
     #[tokio::test]
-    async fn summarizer_loop_exits_on_cancel() {
+    async fn timeline_loop_exits_on_cancel() {
         let segments = Arc::new(Mutex::new(Vec::<Segment>::new()));
-        let state = Arc::new(SummarizerState::new(1));
-        let emitter: Arc<dyn SummaryEmitter> = Arc::new(MockEmitter::default());
+        let state = Arc::new(TimelineState::new(1));
+        let emitter: Arc<dyn TimelineEmitter> = Arc::new(MockTimelineEmitter::default());
         let cancel = Arc::new(AtomicBool::new(false));
         let current_session_id = Arc::new(AtomicU64::new(1));
         let cfg = SummarizerConfig::new(reqwest::Client::new(), "http://unused".into(), "x".into());
 
         let cancel_c = cancel.clone();
-        let handle = tokio::spawn(summarizer_loop(
+        let handle = tokio::spawn(timeline_loop(
             segments, state, emitter, cancel, current_session_id, cfg,
-            Duration::from_millis(50),
+            Duration::from_millis(50), 5,
         ));
 
         tokio::time::sleep(Duration::from_millis(150)).await;
         cancel_c.store(true, Ordering::Release);
 
         let joined = tokio::time::timeout(Duration::from_secs(2), handle).await;
-        assert!(joined.is_ok(), "summarizer_loop should exit within 2s after cancel");
+        assert!(joined.is_ok(), "timeline_loop should exit within 2s after cancel");
     }
 
-    // ---------------------------------------------------------------------------
-    // Task 17: happy path + skip-when-no-new-segments
-    // ---------------------------------------------------------------------------
-
     #[tokio::test]
-    async fn summarizer_loop_emits_summary_for_new_segments() {
+    async fn timeline_loop_emits_entries_for_new_segments() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/chat"))
@@ -891,19 +964,20 @@ mod tests {
             .await;
 
         let segments = Arc::new(Mutex::new(vec![
-            Segment { timestamp: "t".into(), source: Source::Mic, text: "hi".into() },
+            Segment { timestamp: "2026-04-24T10:00:00.000+09:00".into(), source: Source::Mic, text: "hi".into() },
         ]));
-        let state = Arc::new(SummarizerState::new(100));
-        let emitter_inner = Arc::new(MockEmitter::default());
-        let emitter: Arc<dyn SummaryEmitter> = emitter_inner.clone();
+        let state = Arc::new(TimelineState::new(100));
+        let state_c = state.clone();
+        let emitter_inner = Arc::new(MockTimelineEmitter::default());
+        let emitter: Arc<dyn TimelineEmitter> = emitter_inner.clone();
         let cancel = Arc::new(AtomicBool::new(false));
         let current_session_id = Arc::new(AtomicU64::new(100));
         let cfg = SummarizerConfig::new(reqwest::Client::new(), server.uri(), "qwen3:4b".into());
 
         let cancel_c = cancel.clone();
-        let handle = tokio::spawn(summarizer_loop(
+        let handle = tokio::spawn(timeline_loop(
             segments, state, emitter, cancel, current_session_id, cfg,
-            Duration::from_millis(50),
+            Duration::from_millis(50), 5,
         ));
 
         tokio::time::sleep(Duration::from_millis(400)).await;
@@ -911,28 +985,35 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
 
         let calls = emitter_inner.calls.lock().unwrap().clone();
-        let summary_count = calls.iter().filter(|e| matches!(e, EmittedEvent::Summary { .. })).count();
-        let generating_count = calls.iter().filter(|e| matches!(e, EmittedEvent::Generating { .. })).count();
-        assert!(summary_count >= 1, "expected >= 1 summary emit, got calls: {calls:?}");
-        assert_eq!(generating_count, summary_count, "each summary should be preceded by a generating event");
+        let entry_count = calls.iter().filter(|e| matches!(e, EmittedTimelineEvent::Entry { .. })).count();
+        let gen_count = calls.iter().filter(|e| matches!(e, EmittedTimelineEvent::Generating { .. })).count();
+        assert!(entry_count >= 1, "expected >= 1 entry emit, got: {calls:?}");
+        assert_eq!(gen_count, entry_count, "each entry should be preceded by a generating event");
+        assert_eq!(state_c.entries.lock().unwrap().len(), entry_count);
+        // 成功した tick のぶんだけ pointer が進んでいる (segments.len() == 1 なので上限は 1)
+        assert_eq!(
+            state_c.last_committed_end_index.load(Ordering::Acquire),
+            1,
+            "last_committed_end_index should advance to segments.len() on success"
+        );
     }
 
     #[tokio::test]
-    async fn summarizer_loop_skips_when_no_new_segments() {
+    async fn timeline_loop_skips_when_no_new_segments() {
         let server = MockServer::start().await;
-
         let segments = Arc::new(Mutex::new(Vec::<Segment>::new()));
-        let state = Arc::new(SummarizerState::new(1));
-        let emitter_inner = Arc::new(MockEmitter::default());
-        let emitter: Arc<dyn SummaryEmitter> = emitter_inner.clone();
+        let state = Arc::new(TimelineState::new(1));
+        let state_c = state.clone();
+        let emitter_inner = Arc::new(MockTimelineEmitter::default());
+        let emitter: Arc<dyn TimelineEmitter> = emitter_inner.clone();
         let cancel = Arc::new(AtomicBool::new(false));
         let current_session_id = Arc::new(AtomicU64::new(1));
         let cfg = SummarizerConfig::new(reqwest::Client::new(), server.uri(), "x".into());
 
         let cancel_c = cancel.clone();
-        let handle = tokio::spawn(summarizer_loop(
+        let handle = tokio::spawn(timeline_loop(
             segments, state, emitter, cancel, current_session_id, cfg,
-            Duration::from_millis(50),
+            Duration::from_millis(50), 5,
         ));
         tokio::time::sleep(Duration::from_millis(300)).await;
         cancel_c.store(true, Ordering::Release);
@@ -940,16 +1021,72 @@ mod tests {
 
         let calls = emitter_inner.calls.lock().unwrap().clone();
         assert!(calls.is_empty(), "no segments → no emit, got {calls:?}");
+        // empty-segments の tick で in_flight が残留しないこと
+        assert!(!state_c.in_flight.load(Ordering::Acquire), "in_flight must be false after empty ticks");
     }
 
-    // ---------------------------------------------------------------------------
-    // Task 18: generation skew — newer gen finishes first, older discarded
-    // ---------------------------------------------------------------------------
+    #[tokio::test]
+    async fn timeline_loop_serializes_overlapping_ticks_and_merges_segments() {
+        let server = MockServer::start().await;
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let cc = call_count.clone();
+
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(move |_: &wiremock::Request| {
+                let n = cc.fetch_add(1, Ordering::AcqRel);
+                let delay = if n == 0 { Duration::from_millis(300) } else { Duration::from_millis(20) };
+                ResponseTemplate::new(200)
+                    .set_delay(delay)
+                    .set_body_json(serde_json::json!({
+                        "message": { "role": "assistant", "content": format!("CALL{n}") }
+                    }))
+            })
+            .mount(&server)
+            .await;
+
+        let segments = Arc::new(Mutex::new(vec![
+            Segment { timestamp: "2026-04-24T10:00:00.000+09:00".into(), source: Source::Mic, text: "a".into() },
+        ]));
+        let segments_c = segments.clone();
+
+        let state = Arc::new(TimelineState::new(1));
+        let state_c = state.clone();
+        let emitter_inner = Arc::new(MockTimelineEmitter::default());
+        let emitter: Arc<dyn TimelineEmitter> = emitter_inner.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let current_session_id = Arc::new(AtomicU64::new(1));
+        let cfg = SummarizerConfig::new(reqwest::Client::new(), server.uri(), "x".into());
+
+        let cancel_c = cancel.clone();
+        let handle = tokio::spawn(timeline_loop(
+            segments, state, emitter, cancel, current_session_id, cfg,
+            Duration::from_millis(80), 5,
+        ));
+
+        tokio::time::sleep(Duration::from_millis(180)).await;
+        segments_c.lock().unwrap().push(
+            Segment { timestamp: "2026-04-24T10:00:30.000+09:00".into(), source: Source::Mic, text: "b".into() }
+        );
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        cancel_c.store(true, Ordering::Release);
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+
+        let calls = emitter_inner.calls.lock().unwrap().clone();
+        let entries: Vec<_> = calls.iter().filter_map(|e| {
+            if let EmittedTimelineEvent::Entry { entry, .. } = e { Some(entry.clone()) } else { None }
+        }).collect();
+
+        assert!(entries.len() >= 2, "expected at least 2 entries (1st + merged), got: {entries:?}");
+        assert!(
+            entries.iter().any(|e| e.range_end.contains("10:00:30")),
+            "segment b should appear in a later entry range: {entries:?}"
+        );
+        assert_eq!(state_c.entries.lock().unwrap().len(), entries.len());
+    }
 
     #[tokio::test]
-    async fn summarizer_loop_discards_older_generation_when_newer_finishes_first() {
-        use std::sync::atomic::AtomicUsize;
-
+    async fn timeline_loop_carries_segments_over_on_error() {
         let server = MockServer::start().await;
         let call_count = Arc::new(AtomicUsize::new(0));
         let cc = call_count.clone();
@@ -959,63 +1096,69 @@ mod tests {
             .respond_with(move |_: &wiremock::Request| {
                 let n = cc.fetch_add(1, Ordering::AcqRel);
                 if n == 0 {
-                    ResponseTemplate::new(200)
-                        .set_delay(Duration::from_millis(400))
-                        .set_body_json(serde_json::json!({
-                            "message": { "role": "assistant", "content": "GEN1" }
-                        }))
+                    ResponseTemplate::new(500)
                 } else {
-                    ResponseTemplate::new(200)
-                        .set_delay(Duration::from_millis(50))
-                        .set_body_json(serde_json::json!({
-                            "message": { "role": "assistant", "content": "GEN2" }
-                        }))
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "message": { "role": "assistant", "content": "OK" }
+                    }))
                 }
             })
             .mount(&server)
             .await;
 
         let segments = Arc::new(Mutex::new(vec![
-            Segment { timestamp: "t1".into(), source: Source::Mic, text: "a".into() },
+            Segment { timestamp: "2026-04-24T10:00:00.000+09:00".into(), source: Source::Mic, text: "a".into() },
         ]));
-        let state = Arc::new(SummarizerState::new(1));
-        let emitter_inner = Arc::new(MockEmitter::default());
-        let emitter: Arc<dyn SummaryEmitter> = emitter_inner.clone();
+        let segments_c = segments.clone();
+
+        let state = Arc::new(TimelineState::new(1));
+        let state_c = state.clone();
+        let emitter_inner = Arc::new(MockTimelineEmitter::default());
+        let emitter: Arc<dyn TimelineEmitter> = emitter_inner.clone();
         let cancel = Arc::new(AtomicBool::new(false));
         let current_session_id = Arc::new(AtomicU64::new(1));
         let cfg = SummarizerConfig::new(reqwest::Client::new(), server.uri(), "x".into());
 
-        let segments_c = segments.clone();
         let cancel_c = cancel.clone();
-        let handle = tokio::spawn(summarizer_loop(
+        let handle = tokio::spawn(timeline_loop(
             segments, state, emitter, cancel, current_session_id, cfg,
-            Duration::from_millis(50),
+            Duration::from_millis(80), 5,
         ));
 
         tokio::time::sleep(Duration::from_millis(120)).await;
         segments_c.lock().unwrap().push(
-            Segment { timestamp: "t2".into(), source: Source::Mic, text: "b".into() }
+            Segment { timestamp: "2026-04-24T10:00:30.000+09:00".into(), source: Source::Mic, text: "b".into() }
         );
-        tokio::time::sleep(Duration::from_millis(600)).await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
         cancel_c.store(true, Ordering::Release);
         let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
 
         let calls = emitter_inner.calls.lock().unwrap().clone();
-        let summaries: Vec<_> = calls.iter().filter_map(|e| {
-            if let EmittedEvent::Summary { generation, text, .. } = e { Some((*generation, text.clone())) } else { None }
+        let entries: Vec<_> = calls.iter().filter_map(|e| {
+            if let EmittedTimelineEvent::Entry { entry, .. } = e { Some(entry.clone()) } else { None }
+        }).collect();
+        let errors: Vec<_> = calls.iter().filter_map(|e| {
+            if let EmittedTimelineEvent::Error { message, .. } = e { Some(message.clone()) } else { None }
         }).collect();
 
-        assert!(summaries.iter().any(|(g, t)| *g == 2 && t == "GEN2"), "gen2 should be emitted: {summaries:?}");
-        assert!(!summaries.iter().any(|(g, t)| *g == 1 && t == "GEN1"),
-            "gen1 must be discarded because gen2 already displayed: {summaries:?}");
+        assert_eq!(errors.len(), 1, "expected exactly 1 error (only call 0 returns 500): {calls:?}");
+        assert_eq!(entries.len(), 1, "expected exactly 1 entry (carry-over merged a+b into one): {entries:?}");
+        let first_entry = entries.first().unwrap();
+        assert_eq!(first_entry.range_start, "2026-04-24T10:00:00.000+09:00",
+            "range_start should cover the carried-over segment a: {first_entry:?}");
+        assert_eq!(first_entry.range_end, "2026-04-24T10:00:30.000+09:00",
+            "range_end should cover segment b (proves a and b were merged): {first_entry:?}");
+        assert_eq!(state_c.entries.lock().unwrap().len(), 1);
+        // pointer は成功後の segments.len() (= 2) まで進む
+        assert_eq!(
+            state_c.last_committed_end_index.load(Ordering::Acquire),
+            2,
+            "pointer advances only after the successful carry-over tick"
+        );
     }
 
-    // ---------------------------------------------------------------------------
-    // Task 19: session_id guard
-    // ---------------------------------------------------------------------------
-
     #[tokio::test]
-    async fn summarizer_loop_does_not_emit_when_session_id_changed() {
+    async fn timeline_loop_does_not_emit_when_session_id_changed() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/chat"))
@@ -1028,20 +1171,20 @@ mod tests {
             .await;
 
         let segments = Arc::new(Mutex::new(vec![
-            Segment { timestamp: "t".into(), source: Source::Mic, text: "a".into() },
+            Segment { timestamp: "2026-04-24T10:00:00.000+09:00".into(), source: Source::Mic, text: "a".into() },
         ]));
-        let state = Arc::new(SummarizerState::new(1));
-        let emitter_inner = Arc::new(MockEmitter::default());
-        let emitter: Arc<dyn SummaryEmitter> = emitter_inner.clone();
+        let state = Arc::new(TimelineState::new(1));
+        let emitter_inner = Arc::new(MockTimelineEmitter::default());
+        let emitter: Arc<dyn TimelineEmitter> = emitter_inner.clone();
         let cancel = Arc::new(AtomicBool::new(false));
         let current_session_id = Arc::new(AtomicU64::new(1));
         let cfg = SummarizerConfig::new(reqwest::Client::new(), server.uri(), "x".into());
 
         let current_session_id_c = current_session_id.clone();
         let cancel_c = cancel.clone();
-        let handle = tokio::spawn(summarizer_loop(
+        let handle = tokio::spawn(timeline_loop(
             segments, state, emitter, cancel, current_session_id, cfg,
-            Duration::from_millis(50),
+            Duration::from_millis(80), 5,
         ));
 
         tokio::time::sleep(Duration::from_millis(150)).await;
@@ -1052,72 +1195,74 @@ mod tests {
 
         let calls = emitter_inner.calls.lock().unwrap().clone();
         assert!(
-            !calls.iter().any(|e| matches!(e, EmittedEvent::Summary { .. })),
-            "summary must not be emitted for stale session: {calls:?}"
+            !calls.iter().any(|e| matches!(e, EmittedTimelineEvent::Entry { .. })),
+            "entry must not be emitted for stale session: {calls:?}"
         );
     }
 
-    // ---------------------------------------------------------------------------
-    // Task 21: SummaryEventPayload serialization test
-    // ---------------------------------------------------------------------------
-
-    #[test]
-    fn summary_event_payloads_serialize_as_discriminated_union() {
-        let gen_json = serde_json::to_value(&summary_event_generating(100, 5, "2026-04-24T10:00:00.000+09:00")).unwrap();
-        assert_eq!(gen_json["type"], "generating");
-        assert_eq!(gen_json["session_id"], 100);
-        assert_eq!(gen_json["generation"], 5);
-        assert_eq!(gen_json["timestamp"], "2026-04-24T10:00:00.000+09:00");
-
-        let sum_json = serde_json::to_value(&summary_event_summary(100, 5, "2026-04-24T10:00:00.000+09:00", "要約本文")).unwrap();
-        assert_eq!(sum_json["type"], "summary");
-        assert_eq!(sum_json["text"], "要約本文");
-
-        let err_json = serde_json::to_value(&summary_event_error(100, 5, "2026-04-24T10:00:00.000+09:00", "エラー")).unwrap();
-        assert_eq!(err_json["type"], "error");
-        assert_eq!(err_json["message"], "エラー");
-    }
-
-    // ---------------------------------------------------------------------------
-    // Task 20: running_count leak on generation error
-    // ---------------------------------------------------------------------------
-
     #[tokio::test]
-    async fn summarizer_loop_releases_slot_on_generation_error() {
+    async fn timeline_loop_passes_only_last_n_entries_as_context() {
+        use std::sync::Mutex as StdMutex;
         let server = MockServer::start().await;
+        let bodies = Arc::new(StdMutex::new(Vec::<String>::new()));
+        let bodies_c = bodies.clone();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_c = counter.clone();
+
         Mock::given(method("POST"))
             .and(path("/api/chat"))
-            .respond_with(ResponseTemplate::new(500))
+            .respond_with(move |req: &wiremock::Request| {
+                let body_str = String::from_utf8_lossy(&req.body).to_string();
+                bodies_c.lock().unwrap().push(body_str);
+                let n = counter_c.fetch_add(1, Ordering::AcqRel);
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "message": { "role": "assistant", "content": format!("E{n}") }
+                }))
+            })
             .mount(&server)
             .await;
 
+        // 事前に 3 つのダミー entry を state に入れておく。
+        // generation は 100 以降にして、tick 由来の generation (1 始まり) と衝突しないようにする。
+        let state = Arc::new(TimelineState::new(1));
+        {
+            let mut lock = state.entries.lock().unwrap();
+            for i in 0..3 {
+                lock.push(TimelineEntry {
+                    generation: 100 + i,
+                    range_start: format!("2026-04-24T10:0{i}:00.000+09:00"),
+                    range_end: format!("2026-04-24T10:0{i}:30.000+09:00"),
+                    text: format!("OLD{i}"),
+                });
+            }
+        }
+
         let segments = Arc::new(Mutex::new(vec![
-            Segment { timestamp: "t".into(), source: Source::Mic, text: "a".into() },
+            Segment { timestamp: "2026-04-24T10:10:00.000+09:00".into(), source: Source::Mic, text: "new".into() },
         ]));
-        let state = Arc::new(SummarizerState::new(1));
-        let state_c = state.clone();
-        let emitter_inner = Arc::new(MockEmitter::default());
-        let emitter: Arc<dyn SummaryEmitter> = emitter_inner.clone();
+        let emitter_inner = Arc::new(MockTimelineEmitter::default());
+        let emitter: Arc<dyn TimelineEmitter> = emitter_inner.clone();
         let cancel = Arc::new(AtomicBool::new(false));
         let current_session_id = Arc::new(AtomicU64::new(1));
         let cfg = SummarizerConfig::new(reqwest::Client::new(), server.uri(), "x".into());
 
         let cancel_c = cancel.clone();
-        let handle = tokio::spawn(summarizer_loop(
+        let handle = tokio::spawn(timeline_loop(
             segments, state, emitter, cancel, current_session_id, cfg,
-            Duration::from_millis(50),
+            Duration::from_millis(80),
+            2, // context_window N = 2
         ));
 
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
         cancel_c.store(true, Ordering::Release);
         let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let running = state_c.running_count.load(Ordering::Acquire);
-        assert_eq!(running, 0, "running_count should be 0 after all generations errored, got {running}");
-
-        let error_count = emitter_inner.calls.lock().unwrap().iter()
-            .filter(|e| matches!(e, EmittedEvent::Error { .. })).count();
-        assert!(error_count >= 1, "expected at least 1 error emit");
+        let captured = bodies.lock().unwrap().clone();
+        assert!(!captured.is_empty(), "expected at least 1 request");
+        let first = &captured[0];
+        // N=2 なので OLD1, OLD2 だけが含まれ、OLD0 は含まれない
+        assert!(first.contains("OLD1"), "should include OLD1: {first}");
+        assert!(first.contains("OLD2"), "should include OLD2: {first}");
+        assert!(!first.contains("OLD0"), "should NOT include OLD0: {first}");
     }
 }

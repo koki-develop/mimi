@@ -33,15 +33,17 @@ struct AppState {
     current_session_id: Arc<AtomicU64>,
     summarizer_config: Arc<summarizer::SummarizerConfig>,
     summary_interval: Duration,
+    context_window: usize,
 }
 
 impl AppState {
-    fn new(cfg: summarizer::SummarizerConfig, summary_interval: Duration) -> Self {
+    fn new(cfg: summarizer::SummarizerConfig, summary_interval: Duration, context_window: usize) -> Self {
         Self {
             recording: Mutex::new(None),
             current_session_id: Arc::new(AtomicU64::new(0)),
             summarizer_config: Arc::new(cfg),
             summary_interval,
+            context_window,
         }
     }
 }
@@ -110,8 +112,9 @@ async fn start_recording(app: AppHandle, state: State<'_, AppState>) -> Result<(
                         guard.take()
                     };
                     if let Some(recording) = taken {
-                        // stop_recording と同順序のクリーンアップ (spec §5.1)
-                        // 1. summarizer_cancel 最初
+                        // stop_recording と同順序のクリーンアップ
+                        // (docs/superpowers/specs/2026-04-24-timeline-summarizer-design.md §4.2)
+                        // 1. summarizer_cancel 最初 (+ session_id=0 で走行中 child の emit を弾く)
                         recording.summarizer_cancel.store(true, Ordering::Release);
                         state.current_session_id.store(0, std::sync::atomic::Ordering::Release);
                         // 2-3. SIGINT と terminated 待ちはこのパスでは不要
@@ -134,7 +137,7 @@ async fn start_recording(app: AppHandle, state: State<'_, AppState>) -> Result<(
 
     let segments: Arc<Mutex<Vec<Segment>>> = Arc::new(Mutex::new(Vec::new()));
 
-    use summarizer::SummarizerState;
+    use summarizer::TimelineState;
 
     // tail
     let tail_cancel = Arc::new(AtomicBool::new(false));
@@ -146,24 +149,27 @@ async fn start_recording(app: AppHandle, state: State<'_, AppState>) -> Result<(
         tail_file(tail_path, app_handle, tail_cancel_c, segments_for_tail).await
     });
 
-    // summarizer
-    let summarizer_state = Arc::new(SummarizerState::new(session_id));
+    // timeline summarizer
+    let timeline_state = Arc::new(TimelineState::new(session_id));
     let summarizer_cancel = Arc::new(AtomicBool::new(false));
-    let emitter: Arc<dyn summarizer::SummaryEmitter> = Arc::new(summarizer::TauriSummaryEmitter { app: app.clone() });
+    let emitter: Arc<dyn summarizer::TimelineEmitter> =
+        Arc::new(summarizer::TauriTimelineEmitter { app: app.clone() });
     let segments_for_loop = segments.clone();
     let cancel_for_loop = summarizer_cancel.clone();
     let session_id_for_loop = state.current_session_id.clone();
     let cfg_for_loop = cfg.as_ref().clone();
     let summary_interval_for_loop = state.summary_interval;
+    let context_window_for_loop = state.context_window;
     let summarizer = tokio::spawn(async move {
-        summarizer::summarizer_loop(
+        summarizer::timeline_loop(
             segments_for_loop,
-            summarizer_state,
+            timeline_state,
             emitter,
             cancel_for_loop,
             session_id_for_loop,
             cfg_for_loop,
             summary_interval_for_loop,
+            context_window_for_loop,
         ).await
     });
 
@@ -201,8 +207,8 @@ async fn stop_recording(state: State<'_, AppState>) -> Result<(), String> {
         summarizer,
     } = recording;
 
-    // 7 ステップ (spec §5.1):
-    // 1. summarizer_cancel 最初
+    // 7 ステップ (docs/superpowers/specs/2026-04-24-timeline-summarizer-design.md §4.2):
+    // 1. summarizer_cancel 最初 (+ session_id=0 で走行中 child の emit を弾く)
     summarizer_cancel.store(true, Ordering::Release);
     state.current_session_id.store(0, std::sync::atomic::Ordering::Release);
 
@@ -332,6 +338,11 @@ pub fn run() {
             .max(10);  // clamp min to 10s
         Duration::from_secs(secs)
     };
+    let context_window = std::env::var("MIMI_CONTEXT_WINDOW_ENTRIES")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(10)
+        .max(1);  // clamp min to 1
     let http = reqwest::Client::builder()
         .build()
         .expect("failed to build reqwest client");
@@ -340,7 +351,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
-        .manage(AppState::new(cfg, summary_interval))
+        .manage(AppState::new(cfg, summary_interval, context_window))
         .invoke_handler(tauri::generate_handler![start_recording, stop_recording])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -37,24 +37,17 @@ type TranscribeEvent =
       data: { reason: "sigint" | "error" };
     };
 
-type SummaryEvent =
-  | { type: "summary"; session_id: number; generation: number; timestamp: string; text: string }
+type TimelineEntry = {
+  generation: number;
+  range_start: string; // ISO8601
+  range_end: string;
+  text: string;
+};
+
+type TimelineEvent =
   | { type: "generating"; session_id: number; generation: number; timestamp: string }
+  | { type: "entry"; session_id: number; generation: number; entry: TimelineEntry }
   | { type: "error"; session_id: number; generation: number; timestamp: string; message: string };
-
-type SummaryState = {
-  text: string | null;
-  generating: boolean;
-  error: string | null;
-  updatedAt: string | null;  // raw ISO8601; formatted at render time
-};
-
-const INITIAL_SUMMARY_STATE: SummaryState = {
-  text: null,
-  generating: false,
-  error: null,
-  updatedAt: null,
-};
 
 type Segment = {
   timestamp: string;
@@ -63,15 +56,17 @@ type Segment = {
 };
 
 function formatTime(iso: string): string {
-  try {
-    const d = new Date(iso);
-    const hh = String(d.getHours()).padStart(2, "0");
-    const mm = String(d.getMinutes()).padStart(2, "0");
-    const ss = String(d.getSeconds()).padStart(2, "0");
-    return `${hh}:${mm}:${ss}`;
-  } catch {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) {
+    // new Date(invalid) は throw せず Invalid Date を返す。
+    // getHours() が NaN になると "NaN:NaN:NaN" が画面に出るので、raw ISO に fallback する。
+    console.warn("[timeline] formatTime: invalid ISO8601:", iso);
     return iso;
   }
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mm = String(d.getMinutes()).padStart(2, "0");
+  const ss = String(d.getSeconds()).padStart(2, "0");
+  return `${hh}:${mm}:${ss}`;
 }
 
 function App() {
@@ -80,7 +75,9 @@ function App() {
   const [status, setStatus] = useState("idle");
   const [segments, setSegments] = useState<Segment[]>([]);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
-  const [summary, setSummary] = useState<SummaryState>(INITIAL_SUMMARY_STATE);
+  const [entries, setEntries] = useState<TimelineEntry[]>([]);
+  const [timelineGenerating, setTimelineGenerating] = useState(false);
+  const [timelineError, setTimelineError] = useState<string | null>(null);
 
   useEffect(() => {
     const unlistenPromise = listen<TranscribeEvent>(
@@ -128,31 +125,25 @@ function App() {
   }, []);
 
   useEffect(() => {
-    const unlistenPromise = listen<SummaryEvent>("summary://event", (e) => {
+    const unlistenPromise = listen<TimelineEvent>("timeline://event", (e) => {
       const event = e.payload;
       switch (event.type) {
         case "generating":
-          setSummary((prev) => ({ ...prev, generating: true, error: null }));
+          setTimelineGenerating(true);
+          setTimelineError(null);
           break;
-        case "summary":
-          setSummary({
-            text: event.text,
-            generating: false,
-            error: null,
-            updatedAt: event.timestamp,
-          });
+        case "entry":
+          setEntries((prev) => [...prev, event.entry]);
+          setTimelineGenerating(false);
           break;
         case "error":
-          setSummary((prev) => ({
-            ...prev,
-            generating: false,
-            error: event.message,
-          }));
+          setTimelineGenerating(false);
+          setTimelineError(event.message);
           break;
         default: {
           // 新しい event type が Rust 側で追加されたときに型エラーで気付けるようにする
           const _exhaustive: never = event;
-          console.warn("[summary] unknown event", _exhaustive);
+          console.warn("[timeline] unknown event", _exhaustive);
         }
       }
     });
@@ -169,9 +160,15 @@ function App() {
       if (recording) {
         await invoke("stop_recording");
         setRecording(false);
+        // Rust 側 session_id guard で entry/error emit が抑制されるので、
+        // 生成中に停止すると「生成中…」と「合流します」エラーが残留する。明示的にクリア。
+        setTimelineGenerating(false);
+        setTimelineError(null);
       } else {
         setSegments([]);
-        setSummary(INITIAL_SUMMARY_STATE);
+        setEntries([]);
+        setTimelineGenerating(false);
+        setTimelineError(null);
         setStatus("starting");
         await invoke("start_recording");
         setRecording(true);
@@ -210,27 +207,41 @@ function App() {
           minHeight: "4em",
         }}
       >
-        <div style={{ fontSize: "0.75em", opacity: 0.6, marginBottom: "0.25em" }}>
-          要約
-          {summary.generating && " (生成中…)"}
+        <div style={{ fontSize: "0.75em", opacity: 0.6, marginBottom: "0.5em" }}>
+          タイムライン
         </div>
-        {summary.text ? (
-          <div style={{ whiteSpace: "pre-wrap", fontSize: "0.95em" }}>
-            {summary.text}
+        {entries.length === 0 && !timelineGenerating ? (
+          <div style={{ opacity: 0.5, fontSize: "0.85em" }}>
+            録音を開始すると要約が追加されていきます
           </div>
         ) : (
-          <div style={{ opacity: 0.5, fontSize: "0.85em" }}>
-            録音を開始すると要約が表示されます
-          </div>
+          <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
+            {entries.map((entry) => (
+              <li
+                key={entry.generation}
+                style={{
+                  padding: "0.5em 0",
+                  borderBottom: "1px solid rgba(127,127,127,0.15)",
+                }}
+              >
+                <div style={{ fontSize: "0.7em", opacity: 0.6, marginBottom: "0.25em" }}>
+                  {formatTime(entry.range_start)}
+                </div>
+                <div style={{ whiteSpace: "pre-wrap", fontSize: "0.95em" }}>
+                  {entry.text}
+                </div>
+              </li>
+            ))}
+            {timelineGenerating && (
+              <li style={{ padding: "0.5em 0", opacity: 0.6, fontSize: "0.85em" }}>
+                生成中…
+              </li>
+            )}
+          </ul>
         )}
-        {summary.updatedAt && (
-          <div style={{ fontSize: "0.7em", opacity: 0.5, marginTop: "0.5em" }}>
-            最終更新: {formatTime(summary.updatedAt)}
-          </div>
-        )}
-        {summary.error && (
+        {timelineError && (
           <div style={{ fontSize: "0.75em", color: "crimson", marginTop: "0.5em" }}>
-            要約エラー（次のインターバルで再試行）: {summary.error}
+            要約 1 回失敗（次のインターバルで合流）: {timelineError}
           </div>
         )}
       </section>
