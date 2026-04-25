@@ -12,7 +12,7 @@ impl Config {
         let host = std::env::var("MIMI_OLLAMA_HOST")
             .unwrap_or_else(|_| "http://localhost:11434".to_string());
         let model =
-            std::env::var("MIMI_OLLAMA_MODEL").unwrap_or_else(|_| "qwen3:30b-instruct".to_string());
+            std::env::var("MIMI_OLLAMA_MODEL").unwrap_or_else(|_| "qwen3:4b-instruct".to_string());
         let summary_interval = {
             let secs = std::env::var("MIMI_SUMMARY_INTERVAL_SECONDS")
                 .ok()
@@ -78,7 +78,7 @@ mod tests {
         let _g = EnvGuard::new();
         let c = Config::from_env();
         assert_eq!(c.host, "http://localhost:11434");
-        assert_eq!(c.model, "qwen3:30b-instruct");
+        assert_eq!(c.model, "qwen3:4b-instruct");
         assert_eq!(c.summary_interval, Duration::from_secs(30));
         assert_eq!(c.context_window, 10);
     }
