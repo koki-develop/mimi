@@ -6,24 +6,13 @@ Rust backend for the Tauri shell. See `../CLAUDE.md` for the high-level data flo
 
 - `cargo check --manifest-path src-tauri/Cargo.toml` / `cargo test --manifest-path src-tauri/Cargo.toml` — always use `--manifest-path` instead of `cd src-tauri && cargo ...`. The compound form breaks Claude Code's per-subcommand permission matching and triggers an approval prompt every time.
 
-## Key invariants in `src/lib.rs`
+## Module layout
 
-- **Sidecar self-termination** — the sidecar can die on its own (crash, permission denied, etc.). Both `stop_recording` and the `CommandEvent::Terminated` handler race to `take()` the `Recording` state under a mutex; the winner cleans up, the loser no-ops. Don't collapse this into a single path.
-- **Tail polls before open** — `JSONLWriter` on the Swift side creates the file lazily, so the tail loop waits for `path.exists()` before opening.
-- **Byte-level UTF-8 buffering** — bytes accumulate until `\n`, then decode. Line-based readers that decode eagerly will split multibyte codepoints (Japanese text) across reads.
-- **Tmp JSONL is transport-only** — lives at `std::env::temp_dir()/mimi-<ms>.jsonl`, deleted on stop. Not a user-visible artifact.
-
-## Timeline summarizer
-
-`src/summarizer.rs` runs `timeline_loop` during recording: every tick it sends new segments plus the last N entries to Ollama `/api/chat` and pushes a `TimelineEntry` on success.
-
-- **Env vars** — `MIMI_SUMMARY_INTERVAL_SECONDS` (default 30 s, clamped ≥10), `MIMI_OLLAMA_MODEL` (default `qwen3:4b-instruct` — thinking-free `Qwen3-4B-Instruct-2507`), `MIMI_OLLAMA_HOST` (default `http://localhost:11434`), `MIMI_CONTEXT_WINDOW_ENTRIES` (default 10, clamped ≥1).
-- **Ollama health check** — `start_recording` hits `/api/tags` **before** spawning the sidecar. Unreachable host or missing model → recording fails outright.
-- **Serial generation** — `TimelineState.in_flight: AtomicBool` guarantees one generation at a time. Overlapping ticks are skipped; their segments accumulate into the next run. `InFlightGuard` (RAII) releases the flag on Drop, so a panicking task can't wedge the loop.
-- **Error carry-over** — `last_committed_end_index` advances **only** on successful push, so failed intervals are retried on the next tick.
-- **Session guard** — the `session_id` captured by the spawned task discards late completions from a stopped session.
-- **`TimelineEvent` payload** — discriminated union tagged by `type`: `generating`, `entry` (with nested `entry: TimelineEntry`), `error` (with `message`).
-- **Full design** — `docs/superpowers/specs/2026-04-24-timeline-summarizer-design.md`.
+- `src/lib.rs` — thin entry point (~20 lines). Builds the Tauri app, wires the plugins, installs `AppState`, registers command handlers.
+- `src/main.rs` — calls `app_lib::run()`. Standard Tauri boilerplate.
+- `src/config.rs` — `Config::from_env()` reads the `MIMI_*` env vars and applies clamps.
+- `src/app/` — sidecar lifecycle + IPC (the `#[tauri::command]` handlers, `AppState`, the tail loop). See `@src/app/CLAUDE.md`.
+- `src/summarizer/` — timeline-summary pipeline (Ollama client, prompt assembly, periodic loop, event emitter). See `@src/summarizer/CLAUDE.md`.
 
 ## Sidecar bundling
 
