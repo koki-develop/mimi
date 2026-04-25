@@ -1,12 +1,12 @@
 import Foundation
 
 public actor EventLogger {
-  private let writer: JSONLWriter
+  private let sink: any EventSink
   private let console: ConsoleReporter
   private var reportedWriteFailure = false
 
-  public init(writer: JSONLWriter, console: ConsoleReporter) {
-    self.writer = writer
+  public init(sink: any EventSink, console: ConsoleReporter) {
+    self.sink = sink
     self.console = console
   }
 
@@ -65,26 +65,23 @@ public actor EventLogger {
     await console.reportStatus(message)
   }
 
-  /// セッション中に 1 回でも JSONL write が失敗していたかを返す。
-  /// `Pipeline` が finalize 後にこれを参照し、true なら `PipelineError.ioFailed` として
-  /// CLI に伝える。これにより「JSONL に書けてないけど CLI は exit 0 で正常終了」という
-  /// silent failure を排除する。
+  /// セッション中に 1 回でも sink への write が失敗していたかを返す。
+  /// daemon では各セッションの後始末経路で参照することがある (現状は flushedWithErrors を
+  /// 直接 exit code に紐付けないが、stderr 通知の判定に使う)。
   public func flushedWithErrors() -> Bool {
     reportedWriteFailure
   }
 
   private func tryWrite(_ event: Event) async {
     do {
-      try await writer.write(event)
+      try await sink.write(event)
     } catch {
-      // best-effort: JSONL 書き込み失敗は本メソッドからは throw しない。
+      // best-effort: sink への書き込み失敗は本メソッドからは throw しない。
       // 失敗を stderr で 1 回だけ通知する (後続の呼び出しで flood しないようフラグで制御)。
-      // 以降のイベントが欠落し得るので、CLI exit code は `flushedWithErrors()` 経由で
-      // `Pipeline` が `.ioFailed` として throw する責務を持つ。
       if !reportedWriteFailure {
         reportedWriteFailure = true
         await console.reportError(
-          "JSONL write failed; subsequent events may be missing from the file: \(error)"
+          "event sink write failed; subsequent events may be missing: \(error)"
         )
       }
     }

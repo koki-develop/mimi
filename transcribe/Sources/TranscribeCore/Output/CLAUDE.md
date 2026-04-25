@@ -1,5 +1,5 @@
 # Sources/TranscribeCore/Output
 
-**`JSONLWriter` refuses to overwrite existing files** via `O_EXCL`; `Pipeline.run` also pre-checks. Preserve this — it's the user's crash-safety net.
+**`StdoutEventWriter`** is the production `EventSink` — writes one JSON line per `Event` to `FileHandle.standardOutput`. EPIPE on write surfaces as a `StdoutEventWriterError.closed`-equivalent and propagates up to `TranscribeDaemon.run`. Do not add another sink without extending the `EventSink` protocol.
 
-**`EventLogger.flushedWithErrors()`** lets `Pipeline.run` surface a session's JSONL write failures as `PipelineError.ioFailed` (non-zero CLI exit). The 1-shot stderr notification on first write failure is intentional (avoids flood); the boolean is what reaches the CLI exit code.
+**`EventLogger.flushedWithErrors()`** is no longer wired into a daemon-level exit-code path (the daemon doesn't have a single end-of-run point that can report it). The 1-shot stderr notification on first write failure is still intentional (avoids flood); consumers needing per-session reliability should treat the daemon's `error` event stream as the source of truth.

@@ -15,19 +15,20 @@ Package manager is **bun**, not npm/yarn. Use the Makefile for anything that tou
 
 ## Architecture
 
-The app is a thin Tauri shell around the Swift `transcribe` CLI. There is **no in-process transcription logic** — Rust spawns the sidecar as a child process and streams its output to the frontend.
+The app is a thin Tauri shell around the Swift `transcribe` daemon. There is **no in-process transcription logic** — Rust spawns the daemon at app launch as a long-lived sidecar and streams its output to the frontend over stdout.
 
 Data flow:
 
 ```
 React (src/App.tsx)
-  ├── invoke("start_recording") ─▶ Rust: spawn sidecar `transcribe -o <tmpfile>.jsonl`
-  │                                       └── tokio task tails the JSONL file
-  │                                             └── app.emit("transcribe://event", <parsed JSON>)
-  ├── listen("transcribe://event") ◀─────────────────┘
-  └── invoke("stop_recording")  ─▶ Rust: SIGINT → wait(≤10s) → drain tail → rm tmpfile
+  ├── invoke("start_recording") ─▶ Rust: write {"type":"start"}\n to daemon stdin
+  ├── invoke("stop_recording")  ─▶ Rust: write {"type":"stop"}\n to daemon stdin
+  ├── listen("transcribe://event") ◀─ Rust: stdout-reader task forwards every JSON
+  │                                          line emitted by the daemon
+  └── (daemon is spawned once during tauri::Builder setup, model loads in background;
+        button disabled until state_changed{ready} arrives)
 ```
 
 ## Permissions (macOS)
 
-The Swift sidecar requires **both** microphone and system audio capture permissions — these are linker-injected into the sidecar's `Info.plist` (see `../transcribe/CLAUDE.md`). The Tauri host app itself does not request these; permission prompts come from the sidecar on first run.
+The Swift sidecar requires **both** microphone and system audio capture permissions — these are linker-injected into the sidecar's `Info.plist` (see `../transcribe/CLAUDE.md`). The Tauri host app itself does not request these; permission prompts come from the sidecar on first record (per-`start` permission check).

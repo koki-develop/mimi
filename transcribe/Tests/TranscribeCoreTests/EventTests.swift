@@ -97,14 +97,14 @@ import Testing
     #expect(json.contains("\"data\":{\"message\":\"boom\"}"))
   }
 
-  @Test func encodesSessionStoppedSigint() throws {
+  @Test func encodesSessionStoppedStop() throws {
     let event = Event.sessionStopped(
       timestamp: Date(timeIntervalSince1970: 0),
-      data: SessionStoppedData(reason: .sigint)
+      data: SessionStoppedData(reason: .stop)
     )
     let json = try encode(event)
     #expect(json.contains("\"type\":\"session_stopped\""))
-    #expect(json.contains("\"data\":{\"reason\":\"sigint\"}"))
+    #expect(json.contains("\"data\":{\"reason\":\"stop\"}"))
   }
 
   @Test func encodesSessionStoppedError() throws {
@@ -129,7 +129,7 @@ import Testing
       .segment(timestamp: ts, data: SegmentData(source: .system, duration: 2.5, text: "hello")),
       .warning(timestamp: ts, data: WarningData(message: "w")),
       .error(timestamp: ts, data: ErrorData(message: "e")),
-      .sessionStopped(timestamp: ts, data: SessionStoppedData(reason: .sigint)),
+      .sessionStopped(timestamp: ts, data: SessionStoppedData(reason: .stop)),
       .sessionStopped(timestamp: ts, data: SessionStoppedData(reason: .error)),
     ]
 

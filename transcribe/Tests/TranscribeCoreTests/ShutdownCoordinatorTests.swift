@@ -18,17 +18,17 @@ import Testing
 
   @Test func sigintBeatsConsumerEOF() async {
     let c = ShutdownCoordinator()
-    await c.recordSIGINT()
+    await c.recordStop()
     await c.recordConsumerEOF()
     let outcome = await c.finalize(streamError: nil)
-    #expect(outcome.reason == .sigint)
-    if case .sigint = outcome {} else { Issue.record("expected .sigint outcome") }
+    #expect(outcome.reason == .stop)
+    if case .stop = outcome {} else { Issue.record("expected .stop outcome") }
   }
 
   @Test func consumerEOFBeforeSigintStillSetsError() async {
     let c = ShutdownCoordinator()
     await c.recordConsumerEOF()
-    await c.recordSIGINT()  // tryset 後なので無視される
+    await c.recordStop()  // tryset 後なので無視される
     let outcome = await c.finalize(streamError: nil)
     #expect(outcome.reason == .error)
     if case .error(let message, _) = outcome {
@@ -41,7 +41,7 @@ import Testing
   @Test func streamErrorInFinalizeOverridesSigint() async {
     struct E: Error {}
     let c = ShutdownCoordinator()
-    await c.recordSIGINT()
+    await c.recordStop()
     let outcome = await c.finalize(streamError: E())
     #expect(outcome.reason == .error)
     if case .error(let message, _) = outcome {
@@ -53,9 +53,9 @@ import Testing
 
   @Test func noStreamErrorMeansNilErrorMessage() async {
     let c = ShutdownCoordinator()
-    await c.recordSIGINT()
+    await c.recordStop()
     let outcome = await c.finalize(streamError: nil)
-    if case .sigint = outcome {} else { Issue.record("expected .sigint outcome") }
+    if case .stop = outcome {} else { Issue.record("expected .stop outcome") }
   }
 
   @Test func defaultReasonWhenNothingRecorded() async {
@@ -68,7 +68,7 @@ import Testing
   @Test func currentReasonReflectsRecorded() async {
     let c = ShutdownCoordinator()
     #expect(await c.currentReason() == nil)
-    await c.recordSIGINT()
-    #expect(await c.currentReason() == .sigint)
+    await c.recordStop()
+    #expect(await c.currentReason() == .stop)
   }
 }

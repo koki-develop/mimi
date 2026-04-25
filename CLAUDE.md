@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `app/` — Tauri 2 desktop shell. React frontend + Rust backend that spawns the Swift CLI as a sidecar.
 - `transcribe/` — standalone Swift 6.3 / SwiftPM CLI. Owns all audio capture + WhisperKit transcription logic.
 
-The Rust side never imports Swift code; the only contract is the JSONL stream the sidecar writes to a tmp file. End-to-end flow and command details live in each component's own `CLAUDE.md` (auto-loaded when you touch its subtree). Start there.
+The Rust side never imports Swift code; the only contract is the line-delimited JSON the sidecar reads on stdin (commands) and writes on stdout (events). End-to-end flow and command details live in each component's own `CLAUDE.md` (auto-loaded when you touch its subtree). Start there.
 
 ## Working across components
 

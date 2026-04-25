@@ -22,8 +22,13 @@ public actor Transcriber: TranscriberProtocol {
     configuration: TranscriberConfiguration,
     verbose: Bool = false
   ) {
+    precondition(
+      model.kit != nil,
+      "Transcriber.init: LoadedModel.kit must be non-nil for production paths. "
+        + "Tests should use FakeTranscriber instead of constructing real Transcriber."
+    )
     self.source = source
-    self.kit = model.kit
+    self.kit = model.kit!
     self.reporter = reporter
     self.verbose = verbose
     self.configuration = configuration

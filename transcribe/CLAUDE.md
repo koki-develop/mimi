@@ -7,9 +7,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Use the Makefile, not raw `swift` — `make test` injects framework search paths / rpaths so `Testing.framework` resolves on Command Line Tools-only machines (plain `swift test` only works with full Xcode installed).
 
 - `make build` / `make test` / `make clean`
-- `make run ARGS="-o out.jsonl"` — `ARGS` is forwarded to `swift run transcribe`.
+- `make run ARGS="..."` — `ARGS` is forwarded to `swift run transcribe`. **NOTE:** the `test` target does NOT forward `ARGS`. To run a single test, use raw `swift test --filter <Suite>.<Test>` (with the same `-Xswiftc -F …` flags the Makefile injects when CLT-only).
 - `make fmt` / `make lint` — `swift format` (Swift 6 toolchain built-in) against `Sources` + `Tests`. `lint` runs with `--strict` (warnings fail). No `.swift-format` config file; defaults are used.
-- Single test: `swift test --filter <Suite>.<Test>` (add the same `-Xswiftc -F …` flags the Makefile uses if CLT-only).
 
 Tests use **swift-testing** (`@Suite` / `@Test` / `#expect`), not XCTest.
 
@@ -34,15 +33,19 @@ Two test targets:
 
 **`Info.plist` is linker-injected**, not bundled. `Package.swift` uses `unsafeFlags` with `-sectcreate __TEXT __info_plist` because the executable is a plain SwiftPM target, not an `.app`. The plist is `exclude`d from resources. `NSAudioCaptureUsageDescription` + `NSMicrophoneUsageDescription` are both required or the first permission prompt crashes (covered by `InfoPlistTests`).
 
-## Pipeline shape
+## Daemon shape
 
-`TranscribeCommand` → `Pipeline.run` wires:
+`TranscribeCommand` → `TranscribeDaemon.run()` performs:
 
-`AudioCapture` (`SCStream` covering mic + system) → per-source `AudioOutputTap` (delegates to `AudioConversionPipeline` for streaming `AVAudioConverter` to 16 kHz mono Float32; `SampleBufferClockMapper` anchors PTS to wall-clock `Date`) → `AsyncStream<CapturedAudioChunk>` → `TimedSampleAccumulator` (pads gaps / trims overlaps) → `windowSeconds` 秒のウィンドウ → `EnergyVAD` gate → `WhisperKit.transcribe` (via `Transcriber` actor) → dedup consecutive identical text → `JSONLWriter` (one event per line, ISO8601 w/ fractional seconds, local TZ) + `ConsoleReporter` (stderr).
+1. `signal(SIGPIPE, SIG_IGN)` (`Sources/TranscribeCore/Daemon/TranscribeDaemon.swift`).
+2. emit `state_changed { loading_model }`.
+3. `dependencies.transcriberFactory.loadModels(modelName:logger:)` — boot-time WhisperKit load × 2 (mic ANE / system GPU). On failure: emit `state_changed { fatal }` + `error`, throw `DaemonError.modelLoadFailed`, exit non-zero.
+4. emit `state_changed { ready }`.
+5. command loop: `for await item in dependencies.commandSource()` (multiplexed with internal session-completion signals via `DaemonLoopEvent`). For each `start`: permission check (per-call) → fresh `AudioCapture` (per-session) → fresh `Transcriber` × 2 from the shared `LoadedModels` → emit `session_started` then `state_changed { capturing }` → spawn the consumer task group. For each `stop`: emit `state_changed { stopping }` → record stop reason in `ShutdownCoordinator` → `capture.stop()` → consumer group drains → emit `session_stopped { reason: stop }` + `state_changed { ready }`.
+6. stdin EOF (Tauri host closing pipes during shutdown): clean exit, no `state_changed` events emitted on EOF.
 
-`Pipeline.run` runs four parallel tasks under `withTaskGroup`: mic transcriber consumer, system transcriber consumer, `CaptureDiagnostic` drain (warning + verbose status routed to `EventLogger`), and `signalWaiter` (= `SignalHandler.waitForSIGINT` 経由で SIGINT を `SIG_IGN` + `DispatchSource` で trap、Ctrl-C で stream を clean に閉じる)。`ShutdownCoordinator` actor が segment counter と stop reason を集約し、`Outcome` (sum 型) を返して Pipeline が `error`/`sessionStopped` イベントを順序通り発行する。
+`ShutdownCoordinator` (still per-session) tracks segment count + first stop reason; mid-session capture errors emit `session_stopped { reason: error }` and the daemon stays alive (returns to `ready`).
 
-Pipeline の終端では以下を順に判定して non-zero exit code を返す:
-1. capture が予期せず停止 (stream error) → `PipelineError.captureFailed`
-2. JSONL write 失敗 (`EventLogger.flushedWithErrors`) → `PipelineError.ioFailed`
-3. JSONL close 失敗 → `PipelineError.ioFailed`
+## Wire protocol
+
+Stdin/stdout, line-delimited JSON. See `docs/superpowers/specs/2026-04-25-transcribe-daemon-design.md` for the schema. The Swift `Event` discriminated union (`Sources/TranscribeCore/Output/Event.swift`) is the wire format on the daemon → host direction; `DaemonCommand` (`Sources/TranscribeCore/Daemon/DaemonCommand.swift`) is the host → daemon side.

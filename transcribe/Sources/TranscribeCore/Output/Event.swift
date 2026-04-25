@@ -27,8 +27,10 @@ public struct StateChangedData: Sendable, Codable, Equatable {
 
 public enum State: String, Sendable, Codable, Equatable {
   case loadingModel = "loading_model"
+  case ready
   case capturing
   case stopping
+  case fatal
 }
 
 public struct SegmentData: Sendable, Codable, Equatable {
@@ -68,7 +70,7 @@ public struct SessionStoppedData: Sendable, Codable, Equatable {
 }
 
 public enum StopReason: String, Sendable, Codable, Equatable {
-  case sigint
+  case stop
   case error
 }
 

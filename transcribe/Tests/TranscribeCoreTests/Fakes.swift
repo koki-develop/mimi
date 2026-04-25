@@ -101,53 +101,113 @@ final class FakeTranscriber: TranscriberProtocol, @unchecked Sendable {
 }
 
 /// テスト用 transcriber factory。pre-built fake transcribers を返す。
+/// 新 protocol (loadModels + makeTranscribers) に合わせて 2 段化。
+/// `loadModels` は `LoadedModels.testingPlaceholder` を返し、`makeTranscribers` は
+/// 中身を一切参照せず事前に渡された fake transcribers をそのまま返す。
 struct FakeTranscriberFactory: TranscriberFactory {
   let mic: any TranscriberProtocol
   let system: any TranscriberProtocol
+  /// `loadModels` が throw すべきならここに set。
+  var loadError: Error?
+
+  func loadModels(modelName: String, logger: EventLogger) async throws -> LoadedModels {
+    if let loadError { throw loadError }
+    return .testingPlaceholder
+  }
 
   func makeTranscribers(
-    modelName: String,
+    models: LoadedModels,
     configuration: TranscriberConfiguration,
     verbose: Bool,
     logger: EventLogger
-  ) async throws -> (mic: any TranscriberProtocol, system: any TranscriberProtocol) {
+  ) -> (mic: any TranscriberProtocol, system: any TranscriberProtocol) {
     return (mic: mic, system: system)
   }
 }
 
-/// テスト用 signal waiter。`trigger()` を呼ぶまで suspend し続ける。
-/// `withTaskCancellationHandler` で cancellation 伝播も尊重する。
-final class ControllableSignalWaiter: @unchecked Sendable {
+/// テスト用 `EventSink`。受け取ったイベントを順序通り内部に貯める。
+/// EventLoggerTests / TranscribeDaemonTests から共有して使う。
+/// Swift 6 の strict concurrency 下では async 関数内で NSLock.lock/unlock を呼べないので、
+/// 排他処理は private な sync ヘルパに閉じ込めて async API はそれを呼ぶだけにする。
+final class RecordingEventSink: EventSink, @unchecked Sendable {
   private let lock = NSLock()
-  private var continuation: CheckedContinuation<Void, Never>?
-  private var resumed = false
+  private var events: [Event] = []
+  private var closed = false
 
-  /// SIGINT 待ちの代わり。`trigger()` か Task キャンセルで復帰。
-  func wait() async {
-    await withTaskCancellationHandler {
-      await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-        lock.lock()
-        if resumed {
-          lock.unlock()
-          cont.resume()
-        } else {
-          continuation = cont
-          lock.unlock()
-        }
-      }
-    } onCancel: {
-      trigger()
-    }
+  private func writeSync(_ event: Event) throws {
+    lock.lock()
+    defer { lock.unlock() }
+    if closed { throw RecordingEventSinkError.closed }
+    events.append(event)
   }
 
-  /// SIGINT を「投げる」。
-  func trigger() {
+  private func closeSync() {
     lock.lock()
-    let cont = continuation
-    continuation = nil
-    let alreadyResumed = resumed
-    resumed = true
+    defer { lock.unlock() }
+    closed = true
+  }
+
+  func write(_ event: Event) async throws {
+    try writeSync(event)
+  }
+
+  func close() async throws {
+    closeSync()
+  }
+
+  func recordedEvents() -> [Event] {
+    lock.lock()
+    defer { lock.unlock() }
+    return events
+  }
+}
+
+enum RecordingEventSinkError: Error, Equatable {
+  case closed
+}
+
+/// `TranscribeDaemon` テスト用 factory。`loadModels` は `LoadedModels.testingPlaceholder`
+/// を返す (中身は nil kit + 名前のみの sentinel)。`makeTranscribers` の戻り値は
+/// 事前に渡された fake transcribers をそのまま返すので、`LoadedModels` の中身は
+/// 一切参照されない。
+/// `loadCount` で「daemon は boot 時に 1 度だけ loadModels を呼ぶ」不変条件を検証できる。
+struct PreloadedTranscriberFactory: TranscriberFactory {
+  let mic: any TranscriberProtocol
+  let system: any TranscriberProtocol
+  var loadError: Error?
+  let loadCount = Counter()
+
+  func loadModels(modelName: String, logger: EventLogger) async throws -> LoadedModels {
+    loadCount.increment()
+    if let loadError { throw loadError }
+    return .testingPlaceholder
+  }
+
+  func makeTranscribers(
+    models: LoadedModels,
+    configuration: TranscriberConfiguration,
+    verbose: Bool,
+    logger: EventLogger
+  ) -> (mic: any TranscriberProtocol, system: any TranscriberProtocol) {
+    return (mic: mic, system: system)
+  }
+}
+
+/// テスト用カウンタ (Sendable)。`PreloadedTranscriberFactory.loadCount` で
+/// 「daemon が boot 時 1 度だけモデルロードする」を検証するための回数記録。
+final class Counter: @unchecked Sendable {
+  private let lock = NSLock()
+  private var value = 0
+
+  func increment() {
+    lock.lock()
+    value += 1
     lock.unlock()
-    if !alreadyResumed { cont?.resume() }
+  }
+
+  func current() -> Int {
+    lock.lock()
+    defer { lock.unlock() }
+    return value
   }
 }

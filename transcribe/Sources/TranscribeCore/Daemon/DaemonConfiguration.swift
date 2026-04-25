@@ -1,25 +1,22 @@
 import Foundation
 
-/// `Pipeline` を 1 セッション動かすための設定束。
+/// Daemon を boot するために必要な設定束。
+/// `PipelineConfiguration` から `output: URL` を取り除いたもの — daemon は
+/// stdout に書くので per-session ファイルパスは存在しない。
 ///
 /// 不変条件:
-/// - `output` は file URL であること (HTTP URL 等は不可)
 /// - `modelName` は空文字でないこと
-public struct PipelineConfiguration: Sendable {
-  public let output: URL
+public struct DaemonConfiguration: Sendable {
   public let modelName: String
   public let verbose: Bool
   public let transcriber: TranscriberConfiguration
 
   public init(
-    output: URL,
     modelName: String,
     verbose: Bool = false,
     transcriber: TranscriberConfiguration = TranscriberConfiguration()
   ) {
-    precondition(output.isFileURL, "PipelineConfiguration.output must be a file URL")
-    precondition(!modelName.isEmpty, "PipelineConfiguration.modelName must not be empty")
-    self.output = output
+    precondition(!modelName.isEmpty, "DaemonConfiguration.modelName must not be empty")
     self.modelName = modelName
     self.verbose = verbose
     self.transcriber = transcriber

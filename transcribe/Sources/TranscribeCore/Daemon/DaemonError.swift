@@ -1,8 +1,8 @@
 import Foundation
 
-/// `Pipeline.run` が外に投げる統括エラー。
+/// `TranscribeDaemon.run` (および移行期の `Pipeline.run`) が外に投げる統括エラー。
 /// CLI 層 (`TranscribeCommand`) が `ExitCode` にマッピングする。
-public enum PipelineError: Error, Equatable {
+public enum DaemonError: Error, Equatable {
   case outputAlreadyExists(path: String)
   case permissionDenied(PermissionError)
   case modelLoadFailed(reason: String)
@@ -11,7 +11,7 @@ public enum PipelineError: Error, Equatable {
   case unexpected(reason: String)
 }
 
-extension PipelineError {
+extension DaemonError {
   /// `sysexits.h` 由来の exit code に変換する。
   /// ・73 EX_CANTCREAT  - output 既存
   /// ・77 EX_NOPERM     - permission 拒否系 (denied / restricted)

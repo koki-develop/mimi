@@ -14,7 +14,7 @@ type TranscribeEvent =
   | {
       type: "state_changed";
       timestamp: string;
-      data: { state: "loading_model" | "capturing" | "stopping" };
+      data: { state: "loading_model" | "ready" | "capturing" | "stopping" | "fatal" };
     }
   | {
       type: "segment";
@@ -34,7 +34,7 @@ type TranscribeEvent =
   | {
       type: "session_stopped";
       timestamp: string;
-      data: { reason: "sigint" | "error" };
+      data: { reason: "stop" | "error" };
     };
 
 type TimelineEntry = {
@@ -73,6 +73,8 @@ function App() {
   const [recording, setRecording] = useState(false);
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState("idle");
+  const [daemonReady, setDaemonReady] = useState(false);
+  const [daemonFatal, setDaemonFatal] = useState(false);
   const [segments, setSegments] = useState<Segment[]>([]);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [entries, setEntries] = useState<TimelineEntry[]>([]);
@@ -88,9 +90,30 @@ function App() {
           case "session_started":
             setStatus("session_started");
             break;
-          case "state_changed":
+          case "state_changed": {
             setStatus(event.data.state);
+            switch (event.data.state) {
+              case "ready":
+                setDaemonReady(true);
+                break;
+              case "fatal":
+                setDaemonFatal(true);
+                setDaemonReady(false);
+                setRecording(false);
+                break;
+              case "loading_model":
+              case "capturing":
+              case "stopping":
+                // no daemon-state side effects beyond setStatus
+                break;
+              default: {
+                // 新しい state が Swift 側で追加されたときに型エラーで気付けるようにする
+                const _exhaustive: never = event.data.state;
+                console.warn("[transcribe] unknown state", _exhaustive);
+              }
+            }
             break;
+          }
           case "segment":
             setSegments((prev) => [
               {
@@ -153,7 +176,7 @@ function App() {
   }, []);
 
   async function toggle() {
-    if (busy) return;
+    if (busy || !daemonReady || daemonFatal) return;
     setBusy(true);
     setErrorMsg(null);
     try {
@@ -185,8 +208,18 @@ function App() {
       <h1>mimi</h1>
 
       <div className="row">
-        <button type="button" onClick={toggle} disabled={busy}>
-          {recording ? "録音停止" : "録音開始"}
+        <button
+          type="button"
+          onClick={toggle}
+          disabled={busy || !daemonReady || daemonFatal}
+        >
+          {daemonFatal
+            ? "デーモン停止 (アプリを再起動してください)"
+            : !daemonReady
+              ? "デーモン起動中..."
+              : recording
+                ? "録音停止"
+                : "録音開始"}
         </button>
         <span style={{ marginLeft: "1em" }}>status: {status}</span>
       </div>

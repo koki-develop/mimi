@@ -7,12 +7,10 @@ import TranscribeCore
 public struct TranscribeCommand: AsyncParsableCommand {
   public static let configuration = CommandConfiguration(
     commandName: "transcribe",
-    abstract: "Capture macOS system audio + microphone and transcribe to JSONL in real time.",
-    version: "0.1.0"
+    abstract:
+      "Long-lived transcription daemon. Loads WhisperKit at boot, then services start/stop commands on stdin (line-delimited JSON).",
+    version: "0.2.0"
   )
-
-  @Option(name: [.short, .long], help: "Path to write JSONL output.")
-  public var output: String
 
   @Option(name: [.short, .long], help: "WhisperKit model name.")
   public var model: String = "openai_whisper-large-v3-v20240930_turbo"
@@ -26,20 +24,17 @@ public struct TranscribeCommand: AsyncParsableCommand {
   public init() {}
 
   public mutating func run() async throws {
-    let url = URL(fileURLWithPath: output)
-    let pipeline = Pipeline(
-      configuration: PipelineConfiguration(
-        output: url,
+    let daemon = TranscribeDaemon(
+      configuration: DaemonConfiguration(
         modelName: model,
         verbose: verbose,
         transcriber: TranscriberConfiguration(language: language)
       )
     )
-
     do {
-      try await pipeline.run()
-    } catch let pipelineError as PipelineError {
-      throw ExitCode(pipelineError.exitCode)
+      try await daemon.run()
+    } catch let daemonError as DaemonError {
+      throw ExitCode(daemonError.exitCode)
     } catch {
       throw ExitCode(70)  // EX_SOFTWARE
     }

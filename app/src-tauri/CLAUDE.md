@@ -11,7 +11,7 @@ Rust backend for the Tauri shell. See `../CLAUDE.md` for the high-level data flo
 - `src/lib.rs` — thin entry point (~20 lines). Builds the Tauri app, wires the plugins, installs `AppState`, registers command handlers.
 - `src/main.rs` — calls `app_lib::run()`. Standard Tauri boilerplate.
 - `src/config.rs` — `Config::from_env()` reads the `MIMI_*` env vars and applies clamps.
-- `src/app/` — sidecar lifecycle + IPC (the `#[tauri::command]` handlers, `AppState`, the tail loop). See `@src/app/CLAUDE.md`.
+- `src/app/` — daemon lifecycle + IPC (the `#[tauri::command]` handlers, `AppState`, the `Daemon` struct + stdout reader task in `daemon.rs`). See `@src/app/CLAUDE.md`.
 - `src/summarizer/` — timeline-summary pipeline (Ollama client, prompt assembly, periodic loop, event emitter). See `@src/summarizer/CLAUDE.md`.
 
 ## Sidecar bundling

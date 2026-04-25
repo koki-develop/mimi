@@ -4,41 +4,48 @@ import Testing
 @testable import TranscribeCLI
 
 @Suite struct TranscribeCommandTests {
-  @Test func parsesRequiredOutput() throws {
-    let command = try TranscribeCommand.parse(["--output", "/tmp/x.jsonl"])
-    #expect(command.output == "/tmp/x.jsonl")
+  @Test func parsesWithDefaults() throws {
+    let command = try TranscribeCommand.parse([])
     #expect(command.model == "openai_whisper-large-v3-v20240930_turbo")
     #expect(command.language == "ja")
     #expect(command.verbose == false)
   }
 
   @Test func parsesModelOverride() throws {
-    let command = try TranscribeCommand.parse(["-o", "/tmp/x.jsonl", "-m", "base"])
-    #expect(command.output == "/tmp/x.jsonl")
+    let command = try TranscribeCommand.parse(["--model", "base"])
     #expect(command.model == "base")
   }
 
   @Test func parsesLanguageFlag() throws {
-    let command = try TranscribeCommand.parse(["-o", "/tmp/x.jsonl", "-l", "en"])
+    let command = try TranscribeCommand.parse(["--language", "en"])
     #expect(command.language == "en")
   }
 
   @Test func parsesVerboseFlag() throws {
-    let command = try TranscribeCommand.parse(["-o", "/tmp/x.jsonl", "--verbose"])
+    let command = try TranscribeCommand.parse(["--verbose"])
     #expect(command.verbose == true)
   }
 
-  @Test func failsWithoutOutput() {
+  @Test func parsesShortFlags() throws {
+    let command = try TranscribeCommand.parse(["-m", "small", "-l", "en", "-v"])
+    #expect(command.model == "small")
+    #expect(command.language == "en")
+    #expect(command.verbose == true)
+  }
+
+  @Test func rejectsUnknownOptionOutput() {
+    // -o / --output was removed when the CLI became a daemon.
     #expect(throws: (any Error).self) {
-      _ = try TranscribeCommand.parse([])
+      _ = try TranscribeCommand.parse(["--output", "/tmp/x.jsonl"])
     }
   }
 
-  @Test func commandConfigurationDeclaresExpectedAbstract() {
+  @Test func commandConfigurationDeclaresDaemonAbstract() {
     #expect(TranscribeCommand.configuration.commandName == "transcribe")
     #expect(
       TranscribeCommand.configuration.abstract
-        == "Capture macOS system audio + microphone and transcribe to JSONL in real time.")
-    #expect(TranscribeCommand.configuration.version == "0.1.0")
+        == "Long-lived transcription daemon. Loads WhisperKit at boot, then services start/stop commands on stdin (line-delimited JSON)."
+    )
+    #expect(TranscribeCommand.configuration.version == "0.2.0")
   }
 }

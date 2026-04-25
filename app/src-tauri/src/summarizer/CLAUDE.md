@@ -17,7 +17,7 @@ Full behavioral design: `docs/superpowers/specs/2026-04-24-timeline-summarizer-d
 
 ## Invariants
 
-- **Ollama health check before sidecar spawn.** `start_recording` hits `/api/tags` *before* spawning the Swift sidecar. Unreachable host or missing model → recording fails outright with a user-facing error string.
+- **Ollama health check before sending `start` to the daemon.** `start_recording` hits `/api/tags` *before* writing the `{"type":"start"}` line to the daemon's stdin. Unreachable host or missing model → recording fails outright with a user-facing error string. (The Swift daemon itself is spawned once at app boot, not per recording — see `app/src-tauri/src/app/CLAUDE.md`.)
 - **Serial generation.** `TimelineState.in_flight: AtomicBool` guarantees one generation at a time. Overlapping ticks skip; their new segments accumulate into the next run. `InFlightGuard` (RAII) releases the flag on `Drop`, so a panicking spawned task cannot wedge the loop permanently.
 - **Error carry-over.** `last_committed_end_index` advances *only* on successful push. Failed intervals retry implicitly on the next tick because `segments[start_index..end_index]` re-includes them.
 - **Session guard.** Each spawned summarizer child task captures `state.session_id` by value and compares to `current_session_id` on completion — late completions from stopped sessions are discarded without emit.
