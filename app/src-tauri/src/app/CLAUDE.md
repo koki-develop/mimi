@@ -5,7 +5,7 @@ Sidecar lifecycle, tail ingestion, and the `#[tauri::command]` handlers.
 ## Modules
 
 - `state.rs` — `AppState` (managed by Tauri via `.manage(...)`), `Recording` (the per-session bundle of pid, cancel flags, spawned tasks, tmp path).
-- `commands.rs` — the two Tauri commands `start_recording` / `stop_recording`, the decomposed spawn helpers (`make_output_path`, `spawn_sidecar`, `spawn_event_monitor`, `spawn_tail_task`, `spawn_summarizer_task`), and the shared `shutdown_recording` cleanup helper.
+- `commands.rs` — the two Tauri commands `start_recording` / `stop_recording`, the decomposed spawn helpers (`make_output_path`, `spawn_sidecar`, `spawn_event_monitor`, `spawn_summarizer_task`), and the shared `shutdown_recording` cleanup helper. The tail task is spawned inline via `tokio::spawn(tail::tail_file(...))`.
 - `tail.rs` — `tail_file` plus pure helpers `drain_complete_lines` (byte-level UTF-8 line splitter) and `parse_jsonl_segment` (JSON → `Segment`). Owns `EVENT_TRANSCRIBE`.
 
 ## Invariants

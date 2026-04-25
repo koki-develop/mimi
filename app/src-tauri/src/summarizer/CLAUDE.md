@@ -8,12 +8,12 @@ Full behavioral design: `docs/superpowers/specs/2026-04-24-timeline-summarizer-d
 
 - `prompt.rs` — domain types (`Segment`, `Source`, `TimelineEntry`) and prompt assembly (`build_entry_prompt`, `escape_xml`, `iso_to_hms`, `format_segments`, `format_previous_entries`, `SYSTEM_PROMPT_ENTRY`). The domain types live here because they are the prompt's inputs/outputs; other submodules import them via `use crate::summarizer::...` thanks to the facade in `mod.rs`.
 - `client.rs` — Ollama HTTP layer. `SummarizerConfig { http, host, model }`, `SummaryError`, `generate_summary`, `health_check`. Ollama request/response types are file-private.
-- `events.rs` — `TimelineEmitter` trait, `TauriTimelineEmitter` impl, `TimelineEventPayload` discriminated union, `EVENT_TIMELINE`. Also hosts a `#[cfg(test)] pub(crate) mod test_support` exposing `MockTimelineEmitter` for reuse by `timeline.rs` tests.
+- `events.rs` — `TimelineEmitter` trait, `TauriTimelineEmitter` impl, `TimelineEventPayload` discriminated union, `EVENT_TIMELINE`. Also hosts a `#[cfg(test)] pub(super) mod test_support` exposing `MockTimelineEmitter` for reuse by `timeline.rs` tests.
 - `timeline.rs` — `TimelineState` (session-scoped), `InFlightGuard` (RAII), `wait_for_cancel`, `timeline_loop(TimelineLoopParams)`.
 
 ## Public API facade
 
-`mod.rs` declares submodules as `pub(crate)` and re-exports the public API flat. Consumers write `crate::summarizer::TimelineState`, not `crate::summarizer::timeline::TimelineState`. Internal reorganization cannot leak through paths.
+`mod.rs` keeps submodules private (`mod client;` etc.) and re-exports only the items consumed outside this module via `pub(crate) use`. Consumers write `crate::summarizer::TimelineState`, not `crate::summarizer::timeline::TimelineState`. Internal reorganization cannot leak through paths.
 
 ## Invariants
 
