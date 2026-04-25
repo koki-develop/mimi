@@ -26,6 +26,6 @@ Full behavioral design: `docs/superpowers/specs/2026-04-24-timeline-summarizer-d
 ## Env vars (read by `crate::config::Config::from_env`)
 
 - `MIMI_OLLAMA_HOST` — default `http://localhost:11434`
-- `MIMI_OLLAMA_MODEL` — default `qwen3:4b-instruct` (thinking-free `Qwen3-4B-Instruct-2507`)
+- `MIMI_OLLAMA_MODEL` — default `qwen3:30b-instruct` (thinking-free `Qwen3-30B-A3B-Instruct-2507`, MoE)
 - `MIMI_SUMMARY_INTERVAL_SECONDS` — default 30, clamped ≥10
 - `MIMI_CONTEXT_WINDOW_ENTRIES` — default 10, clamped ≥1
