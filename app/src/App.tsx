@@ -93,12 +93,12 @@ function App() {
             break;
           case "segment":
             setSegments((prev) => [
-              ...prev,
               {
                 timestamp: event.timestamp,
                 source: event.data.source,
                 text: event.data.text,
               },
+              ...prev,
             ]);
             break;
           case "warning":
@@ -133,7 +133,7 @@ function App() {
           setTimelineError(null);
           break;
         case "entry":
-          setEntries((prev) => [...prev, event.entry]);
+          setEntries((prev) => [event.entry, ...prev]);
           setTimelineGenerating(false);
           break;
         case "error":
@@ -216,6 +216,11 @@ function App() {
           </div>
         ) : (
           <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
+            {timelineGenerating && (
+              <li style={{ padding: "0.5em 0", opacity: 0.6, fontSize: "0.85em" }}>
+                生成中…
+              </li>
+            )}
             {entries.map((entry) => (
               <li
                 key={entry.generation}
@@ -232,11 +237,6 @@ function App() {
                 </div>
               </li>
             ))}
-            {timelineGenerating && (
-              <li style={{ padding: "0.5em 0", opacity: 0.6, fontSize: "0.85em" }}>
-                生成中…
-              </li>
-            )}
           </ul>
         )}
         {timelineError && (
