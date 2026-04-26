@@ -41,6 +41,34 @@ import Testing
     let box = StreamErrorBox()
     #expect(box.take() == nil)
   }
+
+  // shouldDropFrame: pure function 切り出し版の網羅テスト。
+  // ここでフィルタ判定の不変条件をピン留めしておけば、将来 condition 反転や
+  // nil-passthrough 抜けが入った場合に CI で気付ける。
+
+  @Test func shouldDropFrameReturnsFalseWhenStateIsNil() {
+    // system tap は micEnabledState を持たない。常に通す。
+    #expect(AudioOutputTap.shouldDropFrame(micEnabledState: nil) == false)
+  }
+
+  @Test func shouldDropFrameReturnsFalseWhenEnabled() {
+    let state = MicEnabledState(initiallyEnabled: true)
+    #expect(AudioOutputTap.shouldDropFrame(micEnabledState: state) == false)
+  }
+
+  @Test func shouldDropFrameReturnsTrueWhenDisabled() {
+    let state = MicEnabledState(initiallyEnabled: false)
+    #expect(AudioOutputTap.shouldDropFrame(micEnabledState: state) == true)
+  }
+
+  @Test func shouldDropFrameReflectsMidLifetimeToggle() {
+    let state = MicEnabledState(initiallyEnabled: true)
+    #expect(AudioOutputTap.shouldDropFrame(micEnabledState: state) == false)
+    state.setEnabled(false)
+    #expect(AudioOutputTap.shouldDropFrame(micEnabledState: state) == true)
+    state.setEnabled(true)
+    #expect(AudioOutputTap.shouldDropFrame(micEnabledState: state) == false)
+  }
 }
 
 private struct TestError: Error, Equatable {

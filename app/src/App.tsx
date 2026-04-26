@@ -3,12 +3,14 @@ import { Header } from "./components/Header";
 import { LiveTicker } from "./components/LiveTicker";
 import { TimelineList } from "./components/TimelineList";
 import { useElapsed } from "./hooks/useElapsed";
+import { useMicToggle } from "./hooks/useMicToggle";
 import { useTimeline } from "./hooks/useTimeline";
 import { useTranscribeDaemon } from "./hooks/useTranscribeDaemon";
 
 function App() {
   const daemon = useTranscribeDaemon();
   const timeline = useTimeline();
+  const mic = useMicToggle();
   const elapsed = useElapsed(daemon.recording);
 
   async function toggle() {
@@ -33,6 +35,8 @@ function App() {
         daemonFatal={daemon.daemonFatal}
         busy={daemon.busy}
         onToggle={toggle}
+        micEnabled={mic.enabled}
+        onToggleMic={mic.toggle}
       />
       {daemon.recording && <LiveTicker segments={daemon.segments} />}
       <TimelineList

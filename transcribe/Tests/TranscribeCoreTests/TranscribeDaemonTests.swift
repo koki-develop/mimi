@@ -28,17 +28,19 @@ struct TranscribeDaemonTests {
       mic: FakeTranscriber(),
       system: FakeTranscriber()
     ),
-    sink: RecordingEventSink = RecordingEventSink()
+    sink: RecordingEventSink = RecordingEventSink(),
+    micEnabledState: MicEnabledState = MicEnabledState()
   ) async throws -> RecordingEventSink {
     let daemon = TranscribeDaemon(
       configuration: DaemonConfiguration(modelName: "test-model"),
       dependencies: DaemonDependencies(
         permissionCheck: permission,
         transcriberFactory: transcriberFactory,
-        captureFactory: { _ in capture },
+        captureFactory: { _, _ in capture },
         eventSink: sink,
         commandSource: sourceFactory(commands)
-      )
+      ),
+      micEnabledState: micEnabledState
     )
     try await daemon.run()
     return sink
@@ -69,7 +71,7 @@ struct TranscribeDaemonTests {
       dependencies: DaemonDependencies(
         permissionCheck: {},
         transcriberFactory: factory,
-        captureFactory: { _ in FakeCapture() },
+        captureFactory: { _, _ in FakeCapture() },
         eventSink: sink,
         commandSource: sourceFactory([])
       )
@@ -107,7 +109,7 @@ struct TranscribeDaemonTests {
       dependencies: DaemonDependencies(
         permissionCheck: {},
         transcriberFactory: factory,
-        captureFactory: { _ in FakeCapture(autoFinishAfterStart: true) },
+        captureFactory: { _, _ in FakeCapture(autoFinishAfterStart: true) },
         eventSink: sink,
         commandSource: sourceFactory([
           .command(.start), .command(.stop),
@@ -252,6 +254,45 @@ struct TranscribeDaemonTests {
       return nil
     }
     #expect(errorMessages.contains { $0.contains("Capture stopped unexpectedly") })
+  }
+
+  // --- set_mic_enabled ---
+
+  @Test("set_mic_enabled command toggles mic state without a session")
+  func setMicEnabledTogglesStateWithoutSession() async throws {
+    let micState = MicEnabledState(initiallyEnabled: true)
+    _ = try await runDaemon(
+      commands: [
+        .command(.setMicEnabled(enabled: false)),
+        .command(.setMicEnabled(enabled: true)),
+        .command(.setMicEnabled(enabled: false)),
+      ],
+      micEnabledState: micState
+    )
+    #expect(micState.isEnabled() == false)
+  }
+
+  @Test("set_mic_enabled command works mid-session and emits no events")
+  func setMicEnabledMidSession() async throws {
+    let micState = MicEnabledState(initiallyEnabled: true)
+    let sink = try await runDaemon(
+      commands: [
+        .command(.start),
+        .command(.setMicEnabled(enabled: false)),
+        .command(.stop),
+      ],
+      micEnabledState: micState
+    )
+    #expect(micState.isEnabled() == false)
+    // 状態変更は応答イベントを発しない (フロントは楽観的に更新)。
+    let kinds = sink.recordedEvents().map { $0.typeString }
+    #expect(!kinds.contains("warning"))
+    #expect(
+      !sink.recordedEvents().contains(where: { event in
+        if case .error = event { return true }
+        return false
+      })
+    )
   }
 
   // --- stdin EOF ---

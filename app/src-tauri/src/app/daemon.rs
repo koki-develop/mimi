@@ -17,12 +17,16 @@ use crate::summarizer::{
 pub(crate) const EVENT_TRANSCRIBE: &str = "transcribe://event";
 
 /// Wire-protocol command sent to the daemon over stdin.
-/// Mirrors the Swift `DaemonCommand` enum (`{"type":"start"}` / `{"type":"stop"}`).
+/// Mirrors the Swift `DaemonCommand` enum:
+/// - `{"type":"start"}`
+/// - `{"type":"stop"}`
+/// - `{"type":"set_mic_enabled","enabled":bool}`
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub(crate) enum DaemonCommand {
     Start,
     Stop,
+    SetMicEnabled { enabled: bool },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -373,6 +377,18 @@ mod tests {
     fn daemon_command_stop_serializes() {
         let s = serde_json::to_string(&DaemonCommand::Stop).unwrap();
         assert_eq!(s, r#"{"type":"stop"}"#);
+    }
+
+    #[test]
+    fn daemon_command_set_mic_enabled_true_serializes() {
+        let s = serde_json::to_string(&DaemonCommand::SetMicEnabled { enabled: true }).unwrap();
+        assert_eq!(s, r#"{"type":"set_mic_enabled","enabled":true}"#);
+    }
+
+    #[test]
+    fn daemon_command_set_mic_enabled_false_serializes() {
+        let s = serde_json::to_string(&DaemonCommand::SetMicEnabled { enabled: false }).unwrap();
+        assert_eq!(s, r#"{"type":"set_mic_enabled","enabled":false}"#);
     }
 
     // ---- drain_session lifecycle ----

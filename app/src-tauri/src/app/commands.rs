@@ -36,6 +36,20 @@ pub(crate) async fn stop_recording(state: State<'_, AppState>) -> Result<(), Str
     state.daemon.send_command(&DaemonCommand::Stop).await
 }
 
+/// Toggles whether mic audio is forwarded into the Whisper transcriber.
+/// Daemon-wide (persists across sessions, resets on app restart). The Swift
+/// daemon emits no response event — frontend updates state optimistically.
+#[tauri::command]
+pub(crate) async fn set_mic_enabled(
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<(), String> {
+    state
+        .daemon
+        .send_command(&DaemonCommand::SetMicEnabled { enabled })
+        .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

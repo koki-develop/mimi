@@ -19,6 +19,28 @@ struct DaemonCommandTests {
     #expect(cmd == .stop)
   }
 
+  @Test("decodes set_mic_enabled command (true)")
+  func decodesSetMicEnabledTrue() throws {
+    let json = #"{"type":"set_mic_enabled","enabled":true}"#.data(using: .utf8)!
+    let cmd = try JSONDecoder().decode(DaemonCommand.self, from: json)
+    #expect(cmd == .setMicEnabled(enabled: true))
+  }
+
+  @Test("decodes set_mic_enabled command (false)")
+  func decodesSetMicEnabledFalse() throws {
+    let json = #"{"type":"set_mic_enabled","enabled":false}"#.data(using: .utf8)!
+    let cmd = try JSONDecoder().decode(DaemonCommand.self, from: json)
+    #expect(cmd == .setMicEnabled(enabled: false))
+  }
+
+  @Test("rejects set_mic_enabled missing enabled field")
+  func rejectsSetMicEnabledMissingEnabled() {
+    let json = #"{"type":"set_mic_enabled"}"#.data(using: .utf8)!
+    #expect(throws: (any Error).self) {
+      try JSONDecoder().decode(DaemonCommand.self, from: json)
+    }
+  }
+
   @Test("rejects unknown type")
   func rejectsUnknownType() {
     let json = #"{"type":"frobnicate"}"#.data(using: .utf8)!

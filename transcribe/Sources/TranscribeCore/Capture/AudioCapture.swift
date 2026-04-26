@@ -17,6 +17,7 @@ public actor AudioCapture {
   private let systemContinuation: AsyncStream<CapturedAudioChunk>.Continuation
   private let diagnosticContinuation: AsyncStream<CaptureDiagnostic>.Continuation
   private let verbose: Bool
+  private let micEnabledState: MicEnabledState
   private let sessionStart = SessionStartTracker()
   private let streamErrorBox = StreamErrorBox()
 
@@ -32,7 +33,7 @@ public actor AudioCapture {
     streamErrorBox.take()
   }
 
-  public init(verbose: Bool = false) {
+  public init(verbose: Bool = false, micEnabledState: MicEnabledState = MicEnabledState()) {
     var micContinuation: AsyncStream<CapturedAudioChunk>.Continuation!
     var systemContinuation: AsyncStream<CapturedAudioChunk>.Continuation!
     var diagnosticContinuation: AsyncStream<CaptureDiagnostic>.Continuation!
@@ -45,6 +46,7 @@ public actor AudioCapture {
     self.systemContinuation = systemContinuation
     self.diagnosticContinuation = diagnosticContinuation
     self.verbose = verbose
+    self.micEnabledState = micEnabledState
   }
 
   public func start() async throws {
@@ -89,7 +91,8 @@ public actor AudioCapture {
       continuation: micContinuation,
       diagnosticContinuation: diagnosticContinuation,
       verbose: verbose,
-      sessionStart: sessionStart
+      sessionStart: sessionStart,
+      micEnabledState: micEnabledState
     )
     let systemOutput = AudioOutputTap(
       source: .system,

@@ -5,14 +5,22 @@ import Foundation
 public enum DaemonCommand: Sendable, Equatable {
   case start
   case stop
+  /// マイク入力を Whisper に通すかどうかを切り替える。
+  /// `{"type":"set_mic_enabled","enabled":bool}`。session の有無に関わらず受理する
+  /// (daemon-wide フラグ)。
+  case setMicEnabled(enabled: Bool)
 }
 
 extension DaemonCommand: Decodable {
-  private enum CodingKeys: String, CodingKey { case type }
+  private enum CodingKeys: String, CodingKey {
+    case type
+    case enabled
+  }
 
   private enum Kind: String, Decodable {
     case start
     case stop
+    case setMicEnabled = "set_mic_enabled"
   }
 
   public init(from decoder: Decoder) throws {
@@ -21,6 +29,9 @@ extension DaemonCommand: Decodable {
     switch kind {
     case .start: self = .start
     case .stop: self = .stop
+    case .setMicEnabled:
+      let enabled = try container.decode(Bool.self, forKey: .enabled)
+      self = .setMicEnabled(enabled: enabled)
     }
   }
 }

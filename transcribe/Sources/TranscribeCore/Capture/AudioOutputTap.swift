@@ -17,6 +17,10 @@ final class AudioOutputTap: NSObject, SCStreamOutput, @unchecked Sendable {
   private let verbose: Bool
   private let targetFormat: AVAudioFormat
   private let sessionStart: SessionStartTracker
+  /// non-nil な場合、`isEnabled() == false` のとき sample buffer を捨てる。
+  /// **system tap には絶対に渡してはいけない** — system 側に共有 state を渡すと
+  /// mic toggle 操作で system audio まで silent mute されてしまう。mic tap 専用。
+  private let micEnabledState: MicEnabledState?
 
   private let stateLock = NSLock()
   private var state = AudioConversionPipeline()
@@ -26,7 +30,8 @@ final class AudioOutputTap: NSObject, SCStreamOutput, @unchecked Sendable {
     continuation: AsyncStream<CapturedAudioChunk>.Continuation,
     diagnosticContinuation: AsyncStream<CaptureDiagnostic>.Continuation,
     verbose: Bool,
-    sessionStart: SessionStartTracker
+    sessionStart: SessionStartTracker,
+    micEnabledState: MicEnabledState? = nil
   ) {
     self.queue = DispatchQueue(
       label: "me.koki.transcribe.capture.\(source.rawValue)",
@@ -37,6 +42,7 @@ final class AudioOutputTap: NSObject, SCStreamOutput, @unchecked Sendable {
     self.diagnosticContinuation = diagnosticContinuation
     self.verbose = verbose
     self.sessionStart = sessionStart
+    self.micEnabledState = micEnabledState
     self.targetFormat = AVAudioFormat(
       commonFormat: .pcmFormatFloat32,
       sampleRate: 16_000,
@@ -66,6 +72,9 @@ final class AudioOutputTap: NSObject, SCStreamOutput, @unchecked Sendable {
     guard sampleBuffer.isValid, Self.matches(source: source, outputType: type) else {
       return
     }
+    // mic ミュート時はここで捨てる。Whisper にも継続にも届けないので
+    // 推論コストはゼロ (Transcriber は AsyncStream を await したまま idle)。
+    if Self.shouldDropFrame(micEnabledState: micEnabledState) { return }
     guard let inputBuffer = Self.makePCMBuffer(from: sampleBuffer) else { return }
 
     let now = Date()
@@ -104,6 +113,14 @@ final class AudioOutputTap: NSObject, SCStreamOutput, @unchecked Sendable {
     stateLock.lock()
     defer { stateLock.unlock() }
     return body(&state)
+  }
+
+  /// `stream(_:didOutputSampleBuffer:of:)` の早期 return 判定を pure function に
+  /// 切り出したもの。mic tap だけが non-nil な state を持つ。`nil` (= system tap)
+  /// なら常に false (= drop しない)。
+  static func shouldDropFrame(micEnabledState: MicEnabledState?) -> Bool {
+    guard let micEnabledState else { return false }
+    return !micEnabledState.isEnabled()
   }
 
   static func matches(source: AudioSource, outputType: SCStreamOutputType) -> Bool {

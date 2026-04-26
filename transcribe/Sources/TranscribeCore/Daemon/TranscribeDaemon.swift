@@ -11,13 +11,19 @@ private func ignoreSIGPIPE() {
 public actor TranscribeDaemon {
   private let configuration: DaemonConfiguration
   private let dependencies: DaemonDependencies
+  /// daemon ライフタイム全体で 1 インスタンス。`set_mic_enabled` で更新され、
+  /// `captureFactory` 経由で各セッションの mic `AudioOutputTap` に共有参照が渡る。
+  /// session 跨ぎで保持 (再起動でリセット)。
+  private let micEnabledState: MicEnabledState
 
   public init(
     configuration: DaemonConfiguration,
-    dependencies: DaemonDependencies = .default
+    dependencies: DaemonDependencies = .default,
+    micEnabledState: MicEnabledState = MicEnabledState()
   ) {
     self.configuration = configuration
     self.dependencies = dependencies
+    self.micEnabledState = micEnabledState
   }
 
   /// Daemon の entry point。boot → command loop → stdin EOF で復帰。
@@ -78,6 +84,10 @@ public actor TranscribeDaemon {
       switch event {
       case .command(.parseError(let raw)):
         await logger.error("unknown command: \(raw)")
+      case .command(.command(.setMicEnabled(enabled: let enabled))):
+        // session の有無に関わらず受理。mic AudioOutputTap が次回 callback で
+        // 新しい値を読む。応答イベントは emit しない (フロント側で楽観的に state 更新)。
+        micEnabledState.setEnabled(enabled)
       case .command(.command(.start)):
         if sessionHandle != nil {
           await logger.error("already recording")
@@ -157,8 +167,9 @@ extension TranscribeDaemon {
       throw DaemonError.unexpected(reason: String(describing: error))
     }
 
-    // capture (fresh per session — captureFactory invariant)
-    let capture = dependencies.captureFactory(configuration.verbose)
+    // capture (fresh per session — captureFactory invariant)。daemon-wide な
+    // micEnabledState を渡し、capture/mic tap がそれを共有参照する。
+    let capture = dependencies.captureFactory(configuration.verbose, micEnabledState)
     do {
       try await capture.start()
     } catch {

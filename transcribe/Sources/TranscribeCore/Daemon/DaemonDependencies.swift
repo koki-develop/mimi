@@ -8,21 +8,22 @@ import Foundation
 ///   (boot 時には呼ばない — 権限後付け→次回 start で reflect させたいので)。
 /// - `captureFactory` は **セッション毎に必ず新しい capture を返すこと** (旧
 ///   `PipelineDependencies` の同名フィールドの不変条件を継承)。memoize すると
-///   stop 後に再 start できなくなる。
+///   stop 後に再 start できなくなる。第 2 引数の `MicEnabledState` は daemon が
+///   保持する 1 インスタンスで、session を跨いで同じ参照が渡される。
 /// - `eventSink` は daemon ライフタイム全体で同一インスタンスを使う。
 /// - `commandSource` は 0 引数 closure。daemon は `run()` で 1 度呼んで
 ///   `AsyncStream<CommandSourceItem>` を取得し、それを drain する。
 public struct DaemonDependencies: Sendable {
   public let permissionCheck: @Sendable () async throws -> Void
   public let transcriberFactory: any TranscriberFactory
-  public let captureFactory: @Sendable (Bool) -> any CaptureProtocol
+  public let captureFactory: @Sendable (Bool, MicEnabledState) -> any CaptureProtocol
   public let eventSink: any EventSink
   public let commandSource: @Sendable () -> AsyncStream<CommandSourceItem>
 
   public init(
     permissionCheck: @escaping @Sendable () async throws -> Void,
     transcriberFactory: any TranscriberFactory,
-    captureFactory: @escaping @Sendable (Bool) -> any CaptureProtocol,
+    captureFactory: @escaping @Sendable (Bool, MicEnabledState) -> any CaptureProtocol,
     eventSink: any EventSink,
     commandSource: @escaping @Sendable () -> AsyncStream<CommandSourceItem>
   ) {
@@ -39,7 +40,9 @@ extension DaemonDependencies {
   public static let `default` = DaemonDependencies(
     permissionCheck: { try await PermissionChecker.ensureAll() },
     transcriberFactory: DefaultTranscriberFactory(),
-    captureFactory: { verbose in AudioCapture(verbose: verbose) },
+    captureFactory: { verbose, micState in
+      AudioCapture(verbose: verbose, micEnabledState: micState)
+    },
     eventSink: StdoutEventWriter(),
     commandSource: { CommandSource().stream() }
   )
