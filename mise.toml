@@ -4,3 +4,6 @@ betterleaks = "1.8.1"
 lefthook = "2.1.14"
 node = "24.22.1"
 "npm:@fission-ai/openspec" = "1.14.2"
+
+[tasks.bootstrap]
+run = ["lefthook install"]
