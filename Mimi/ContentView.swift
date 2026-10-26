@@ -12,11 +12,20 @@ struct ContentView: View {
                 SessionButton(session: session, summaryModelID: summaryModelID)
 
                 if session.state == .running {
-                    LevelIndicator(speaker: .me, meter: session.microphoneLevel)
+                    LevelIndicator(speaker: .me, meter: session.microphoneLevel, isMuted: session.isMicrophoneMuted)
                     LevelIndicator(speaker: .others, meter: session.systemAudioLevel)
                 }
 
                 Spacer()
+
+                Toggle(isOn: Binding(
+                    get: { session.isMicrophoneMuted },
+                    set: { session.setMicrophoneMuted($0) }
+                )) {
+                    Image(systemName: session.isMicrophoneMuted ? "mic.slash.fill" : "mic")
+                }
+                .toggleStyle(.button)
+                .help(session.isMicrophoneMuted ? "\(Speaker.me.displayName)の音声のミュートを解除" : "\(Speaker.me.displayName)の音声をミュート")
 
                 Toggle(isOn: $isAlwaysOnTop) {
                     Image(systemName: isAlwaysOnTop ? "pin.fill" : "pin")
@@ -77,15 +86,22 @@ private struct SessionButton: View {
 private struct LevelIndicator: View {
     let speaker: Speaker
     let meter: AudioLevelMeter
+    var isMuted = false
 
     var body: some View {
         HStack(spacing: 4) {
-            TimelineView(.animation(minimumInterval: 1.0 / 20)) { _ in
-                Circle()
-                    .fill(speaker.color.opacity(0.2 + 0.8 * Double(meter.level)))
-                    .frame(width: 8, height: 8)
+            if isMuted {
+                Image(systemName: "mic.slash.fill")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            } else {
+                TimelineView(.animation(minimumInterval: 1.0 / 20)) { _ in
+                    Circle()
+                        .fill(speaker.color.opacity(0.2 + 0.8 * Double(meter.level)))
+                        .frame(width: 8, height: 8)
+                }
+                .frame(width: 8, height: 8)
             }
-            .frame(width: 8, height: 8)
             Text(speaker.displayName)
                 .font(.caption)
                 .foregroundStyle(.secondary)

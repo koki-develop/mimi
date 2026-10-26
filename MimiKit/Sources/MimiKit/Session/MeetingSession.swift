@@ -38,6 +38,8 @@ public final class MeetingSession {
     /// The reason the last session failed to start or stopped unexpectedly.
     public private(set) var failure: Failure?
     public private(set) var summaryFailure: SummaryFailure?
+    /// Whether the microphone is excluded from capture. Applies to the current and later sessions.
+    public private(set) var isMicrophoneMuted = false
 
     public let microphoneLevel = AudioLevelMeter()
     public let systemAudioLevel = AudioLevelMeter()
@@ -51,6 +53,9 @@ public final class MeetingSession {
     @ObservationIgnored private var startTask: Task<Void, Never>?
     @ObservationIgnored private var stopTask: Task<Void, Never>?
     @ObservationIgnored private var engines: [any TranscriptionEngine] = []
+    @ObservationIgnored private var microphoneEngine: (any TranscriptionEngine)?
+    @ObservationIgnored private var isMicrophoneCapturing = false
+    @ObservationIgnored private var microphoneReconciliation: Task<Void, Never>?
     @ObservationIgnored private var resultTasks: [Task<Void, Never>] = []
     @ObservationIgnored private var summaryTask: Task<Void, Never>?
 
@@ -92,6 +97,15 @@ public final class MeetingSession {
         await stopRunning()
     }
 
+    /// Mutes or unmutes the microphone. ``isMicrophoneMuted`` changes immediately; capture stops or resumes in
+    /// the background, in call order. When muting, the speech captured before muting is finalized.
+    /// - Returns: A task that completes once capture follows this call.
+    @discardableResult
+    public func setMicrophoneMuted(_ muted: Bool) -> Task<Void, Never> {
+        isMicrophoneMuted = muted
+        return reconcileMicrophone()
+    }
+
     private func stopRunning() async {
         if let stopTask {
             await stopTask.value
@@ -109,12 +123,6 @@ public final class MeetingSession {
     }
 
     private func performStart(summaryModelID: String) async {
-        guard await microphone.requestAccess() else {
-            record(.microphoneAccessDenied)
-            state = .idle
-            return
-        }
-
         do {
             try await startCapture()
         } catch {
@@ -133,30 +141,84 @@ public final class MeetingSession {
 
     private func startCapture() async throws(Failure) {
         let timelineOrigin = mach_absolute_time()
-        let sources: [(source: any AudioSource, speaker: Speaker, meter: AudioLevelMeter)] = [
-            (microphone, .me, microphoneLevel),
-            (systemAudio, .others, systemAudioLevel),
-        ]
-        for (source, speaker, meter) in sources {
-            let engine = makeTranscriptionEngine()
-            engines.append(engine)
-            do {
-                observe(try await engine.start(timelineOrigin: timelineOrigin), from: speaker)
-            } catch {
-                throw .transcription(error)
+
+        microphoneEngine = try await startEngine(for: .me, timelineOrigin: timelineOrigin)
+        // Starts the microphone unless muted. Failures are recorded and checked by `performStart`.
+        await reconcileMicrophone().value
+
+        let systemAudioEngine = try await startEngine(for: .others, timelineOrigin: timelineOrigin)
+        try start(systemAudio, feeding: systemAudioEngine, meter: systemAudioLevel)
+    }
+
+    private func startEngine(for speaker: Speaker, timelineOrigin: UInt64) async throws(Failure) -> any TranscriptionEngine {
+        let engine = makeTranscriptionEngine()
+        engines.append(engine)
+        do {
+            observe(try await engine.start(timelineOrigin: timelineOrigin), from: speaker)
+        } catch {
+            throw .transcription(error)
+        }
+        return engine
+    }
+
+    private func stopMicrophone() {
+        microphone.stop()
+        isMicrophoneCapturing = false
+        microphoneLevel.reset()
+    }
+
+    private func start(_ source: any AudioSource, feeding engine: any TranscriptionEngine, meter: AudioLevelMeter) throws(Failure) {
+        do {
+            try source.start(
+                onBuffer: { @Sendable buffer, hostTime in
+                    engine.append(buffer, hostTime: hostTime)
+                    meter.update(with: buffer)
+                },
+                onFailure: { [weak self] error in self?.fail(.audioCapture(error)) }
+            )
+        } catch {
+            throw .audioCapture(error)
+        }
+    }
+
+    /// Schedules bringing microphone capture in line with ``isMicrophoneMuted``. This is the only path that
+    /// starts or stops the microphone while a session is active, and runs one at a time in call order.
+    private func reconcileMicrophone() -> Task<Void, Never> {
+        let previous = microphoneReconciliation
+        let task = Task { [self] in
+            await previous?.value
+            await applyMicrophoneMute()
+        }
+        microphoneReconciliation = task
+        return task
+    }
+
+    private func applyMicrophoneMute() async {
+        guard isCaptureActive, let microphoneEngine else { return }
+        if isMicrophoneMuted, isMicrophoneCapturing {
+            stopMicrophone()
+            await microphoneEngine.finalizePending()
+        } else if !isMicrophoneMuted, !isMicrophoneCapturing {
+            let isAccessGranted = await microphone.requestAccess()
+            // The session may have stopped, or a new one started, while access was being requested.
+            guard isCaptureActive, self.microphoneEngine === microphoneEngine else { return }
+            guard isAccessGranted else {
+                fail(.microphoneAccessDenied)
+                return
             }
+            // Muting while access was being requested takes precedence.
+            guard !isMicrophoneMuted else { return }
             do {
-                try source.start(
-                    onBuffer: { @Sendable buffer, hostTime in
-                        engine.append(buffer, hostTime: hostTime)
-                        meter.update(with: buffer)
-                    },
-                    onFailure: { [weak self] error in self?.fail(.audioCapture(error)) }
-                )
+                try start(microphone, feeding: microphoneEngine, meter: microphoneLevel)
+                isMicrophoneCapturing = true
             } catch {
-                throw .audioCapture(error)
+                fail(error)
             }
         }
+    }
+
+    private var isCaptureActive: Bool {
+        state == .starting || state == .running
     }
 
     private func observe(_ results: AsyncThrowingStream<TranscriptionResult, any Error>, from speaker: Speaker) {
@@ -188,7 +250,7 @@ public final class MeetingSession {
 
     private func tearDown() async {
         // Capture ends first so that it stops immediately, even while the summary task is still finishing.
-        microphone.stop()
+        stopMicrophone()
         systemAudio.stop()
         await withTaskGroup { group in
             for engine in engines {
@@ -196,11 +258,11 @@ public final class MeetingSession {
             }
         }
         engines = []
+        microphoneEngine = nil
         for task in resultTasks {
             await task.value
         }
         resultTasks = []
-        microphoneLevel.reset()
         systemAudioLevel.reset()
 
         // Loading model weights is not cancellable, so this can wait for an in-flight load to finish.

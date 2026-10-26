@@ -163,6 +163,34 @@ public final class AppleSpeechTranscriptionEngine: TranscriptionEngine {
         }
     }
 
+    public func finalizePending() async {
+        let pending = session.withLock { session -> (SpeechAnalyzer, CMTime, AsyncThrowingStream<TranscriptionResult, any Error>.Continuation)? in
+            guard var current = session else { return nil }
+            defer { session = current }
+            do {
+                try current.flushConverter()
+            } catch {
+                current.results.finish(throwing: error)
+                return nil
+            }
+            // Finalizes through the last sample supplied. With `nil`, the analyzer would only finalize
+            // the audio it has consumed, which may not include all of the audio supplied.
+            let sampleRate = current.analyzerFormat.sampleRate
+            let sampleCount = CMTimeValue((current.timeline.end * sampleRate).rounded())
+            guard sampleCount > 0 else { return nil }
+            return (current.analyzer, CMTime(value: sampleCount - 1, timescale: CMTimeScale(sampleRate)), current.results)
+        }
+        guard let (analyzer, lastSampleTime, results) = pending else { return }
+        do {
+            try await analyzer.finalize(through: lastSampleTime)
+        } catch {
+            // Finishing the engine meanwhile ends the analysis early, which is not a failure.
+            if session.withLock({ $0 != nil }) {
+                results.finish(throwing: error)
+            }
+        }
+    }
+
     public func finish() async {
         let analyzer = session.withLock { session in
             defer { session = nil }

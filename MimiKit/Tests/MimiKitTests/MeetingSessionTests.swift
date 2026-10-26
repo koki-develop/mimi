@@ -11,23 +11,23 @@ private final class FakeAudioSource: AudioSource {
     var startError: (any Error)?
     private(set) var isRunning = false
     private(set) var startCount = 0
-    /// When set, access requests are held until ``grantPendingAccess()``.
+    private(set) var accessRequestCount = 0
+    /// When set, access requests are held until ``answerPendingAccessRequest(granted:)``.
     var holdsAccessRequests = false
-    private var pendingAccessRequest: CheckedContinuation<Void, Never>?
+    private var pendingAccessRequest: CheckedContinuation<Bool, Never>?
 
     var hasPendingAccessRequest: Bool {
         pendingAccessRequest != nil
     }
 
     func requestAccess() async -> Bool {
-        if holdsAccessRequests {
-            await withCheckedContinuation { pendingAccessRequest = $0 }
-        }
-        return isAccessGranted
+        accessRequestCount += 1
+        guard holdsAccessRequests else { return isAccessGranted }
+        return await withCheckedContinuation { pendingAccessRequest = $0 }
     }
 
-    func grantPendingAccess() {
-        pendingAccessRequest?.resume()
+    func answerPendingAccessRequest(granted: Bool = true) {
+        pendingAccessRequest?.resume(returning: granted)
         pendingAccessRequest = nil
     }
 
@@ -57,25 +57,57 @@ private final class FakeAudioSource: AudioSource {
     }
 }
 
+/// Holds waiters until opened.
+private final class Gate: Sendable {
+    private let state = Mutex<(isOpen: Bool, waiters: [CheckedContinuation<Void, Never>])>((false, []))
+
+    func wait() async {
+        await withCheckedContinuation { continuation in
+            let isOpen = state.withLock { state in
+                if !state.isOpen { state.waiters.append(continuation) }
+                return state.isOpen
+            }
+            if isOpen { continuation.resume() }
+        }
+    }
+
+    func open() {
+        let waiters = state.withLock { state in
+            state.isOpen = true
+            defer { state.waiters = [] }
+            return state.waiters
+        }
+        waiters.forEach { $0.resume() }
+    }
+}
+
 private final class FakeTranscriptionEngine: TranscriptionEngine {
     private struct State {
         var continuation: AsyncThrowingStream<TranscriptionResult, any Error>.Continuation?
         var resultsOnFinish: [TranscriptionResult] = []
+        var finalizePendingCount = 0
         var isFinished = false
     }
 
     private let state = Mutex(State())
     private let startError: (any Error)?
+    private let startGate: Gate?
 
-    init(startError: (any Error)? = nil) {
+    init(startError: (any Error)? = nil, startGate: Gate? = nil) {
         self.startError = startError
+        self.startGate = startGate
     }
 
     var isFinished: Bool {
         state.withLock { $0.isFinished }
     }
 
+    var finalizePendingCount: Int {
+        state.withLock { $0.finalizePendingCount }
+    }
+
     func start(timelineOrigin: UInt64) async throws -> AsyncThrowingStream<TranscriptionResult, any Error> {
+        await startGate?.wait()
         if let startError { throw startError }
         let (stream, continuation) = AsyncThrowingStream.makeStream(of: TranscriptionResult.self)
         state.withLock { $0.continuation = continuation }
@@ -83,6 +115,10 @@ private final class FakeTranscriptionEngine: TranscriptionEngine {
     }
 
     func append(_ buffer: AVAudioPCMBuffer, hostTime: UInt64) {}
+
+    func finalizePending() async {
+        state.withLock { $0.finalizePendingCount += 1 }
+    }
 
     func finish() async {
         state.withLock { state in
@@ -135,9 +171,14 @@ private final class FakeTranscriptionEngineFactory {
     private(set) var engines: [FakeTranscriptionEngine] = []
     /// Indexes of engines, in creation order, whose start throws.
     var failingStartIndexes: Set<Int> = []
+    /// Gates that hold the start of engines, by index in creation order.
+    var startGates: [Int: Gate] = [:]
 
     func make() -> any TranscriptionEngine {
-        let engine = FakeTranscriptionEngine(startError: failingStartIndexes.contains(engines.count) ? TestError() : nil)
+        let engine = FakeTranscriptionEngine(
+            startError: failingStartIndexes.contains(engines.count) ? TestError() : nil,
+            startGate: startGates[engines.count]
+        )
         engines.append(engine)
         return engine
     }
@@ -222,7 +263,7 @@ struct MeetingSessionTests {
         #expect(harness.session.state == .starting)
 
         let stop = Task { await harness.session.stop() }
-        harness.microphone.grantPendingAccess()
+        harness.microphone.answerPendingAccessRequest()
         await start.value
         await stop.value
 
@@ -323,6 +364,160 @@ struct MeetingSessionTests {
         try await waitUntil { harness.session.state == .idle }
         #expect(!harness.microphone.isRunning)
         #expect(harness.createdEngines.map(\.isFinished) == [true, true])
+        guard case .audioCapture = harness.session.failure else {
+            Issue.record("Unexpected failure: \(String(describing: harness.session.failure))")
+            return
+        }
+    }
+
+    @Test func mutingStopsMicrophoneAndFinalizesItsSpeech() async {
+        let harness = Harness()
+        await harness.session.start(summaryModelID: "model")
+
+        await harness.session.setMicrophoneMuted(true).value
+        #expect(harness.session.isMicrophoneMuted)
+        #expect(!harness.microphone.isRunning)
+        #expect(harness.systemAudio.isRunning)
+        #expect(harness.createdEngines.map(\.finalizePendingCount) == [1, 0])
+        #expect(harness.session.state == .running)
+
+        await harness.session.setMicrophoneMuted(false).value
+        #expect(harness.microphone.isRunning)
+        #expect(harness.microphone.startCount == 2)
+        #expect(harness.createdEngines.count == 2)
+        await harness.session.stop()
+    }
+
+    @Test func mutingTwiceIsIdempotent() async {
+        let harness = Harness()
+        await harness.session.start(summaryModelID: "model")
+        await harness.session.setMicrophoneMuted(true).value
+        await harness.session.setMicrophoneMuted(true).value
+        #expect(harness.createdEngines[0].finalizePendingCount == 1)
+
+        await harness.session.setMicrophoneMuted(false).value
+        await harness.session.setMicrophoneMuted(false).value
+        #expect(harness.microphone.startCount == 2)
+        await harness.session.stop()
+    }
+
+    @Test func rapidTogglesFollowTheLastCall() async {
+        let harness = Harness()
+        await harness.session.start(summaryModelID: "model")
+
+        harness.session.setMicrophoneMuted(true)
+        harness.session.setMicrophoneMuted(false)
+        harness.session.setMicrophoneMuted(true)
+        await harness.session.setMicrophoneMuted(false).value
+
+        #expect(!harness.session.isMicrophoneMuted)
+        #expect(harness.microphone.isRunning)
+        await harness.session.stop()
+    }
+
+    @Test func muteCarriesOverToLaterSessionsWithoutRequestingAccess() async {
+        let harness = Harness()
+        harness.microphone.isAccessGranted = false
+        await harness.session.setMicrophoneMuted(true).value
+        await harness.session.start(summaryModelID: "model")
+        #expect(harness.session.state == .running)
+        #expect(harness.session.failure == nil)
+        #expect(harness.microphone.accessRequestCount == 0)
+        #expect(harness.microphone.startCount == 0)
+        #expect(harness.systemAudio.isRunning)
+
+        await harness.session.stop()
+        await harness.session.start(summaryModelID: "model")
+        #expect(harness.microphone.startCount == 0)
+        await harness.session.stop()
+    }
+
+    @Test func unmutingRequestsAccess() async throws {
+        let harness = Harness()
+        harness.microphone.isAccessGranted = false
+        await harness.session.setMicrophoneMuted(true).value
+        await harness.session.start(summaryModelID: "model")
+
+        await harness.session.setMicrophoneMuted(false).value
+        #expect(harness.microphone.accessRequestCount == 1)
+        try await waitUntil { harness.session.state == .idle }
+        guard case .microphoneAccessDenied = harness.session.failure else {
+            Issue.record("Unexpected failure: \(String(describing: harness.session.failure))")
+            return
+        }
+    }
+
+    @Test func mutingWhileStartingStopsRunningMicrophoneImmediately() async throws {
+        let harness = Harness()
+        let systemAudioEngineStart = Gate()
+        harness.engineFactory.startGates[1] = systemAudioEngineStart
+        let start = Task { await harness.session.start(summaryModelID: "model") }
+        try await waitUntil { harness.microphone.isRunning }
+
+        await harness.session.setMicrophoneMuted(true).value
+        #expect(harness.session.state == .starting)
+        #expect(!harness.microphone.isRunning)
+
+        systemAudioEngineStart.open()
+        await start.value
+        #expect(harness.session.state == .running)
+        #expect(!harness.microphone.isRunning)
+        #expect(harness.systemAudio.isRunning)
+        await harness.session.stop()
+    }
+
+    @Test func mutingWhileAccessIsRequestedKeepsMicrophoneOff() async throws {
+        let harness = Harness()
+        harness.microphone.holdsAccessRequests = true
+        let start = Task { await harness.session.start(summaryModelID: "model") }
+        try await waitUntil { harness.microphone.hasPendingAccessRequest }
+
+        harness.session.setMicrophoneMuted(true)
+        harness.microphone.answerPendingAccessRequest()
+        await start.value
+
+        #expect(harness.session.state == .running)
+        #expect(harness.microphone.startCount == 0)
+        #expect(harness.systemAudio.isRunning)
+        await harness.session.stop()
+    }
+
+    @Test func accessRequestFromPreviousSessionDoesNotAffectNextSession() async throws {
+        let harness = Harness()
+        await harness.session.setMicrophoneMuted(true).value
+        await harness.session.start(summaryModelID: "model")
+
+        // Unmuting asks for access, and the session stops while the request is pending.
+        harness.microphone.holdsAccessRequests = true
+        harness.session.setMicrophoneMuted(false)
+        try await waitUntil { harness.microphone.hasPendingAccessRequest }
+        await harness.session.stop()
+
+        // The next session waits for the pending request; denying it must not fail the next session.
+        let start = Task { await harness.session.start(summaryModelID: "model") }
+        try await waitUntil { harness.session.state == .starting }
+        harness.microphone.holdsAccessRequests = false
+        harness.microphone.answerPendingAccessRequest(granted: false)
+        await start.value
+
+        #expect(harness.session.state == .running)
+        #expect(harness.session.failure == nil)
+        #expect(harness.microphone.isRunning)
+        #expect(harness.microphone.startCount == 1)
+        await harness.session.stop()
+    }
+
+    @Test func unmuteFailureStopsSession() async {
+        let harness = Harness()
+        await harness.session.start(summaryModelID: "model")
+        await harness.session.setMicrophoneMuted(true).value
+
+        harness.microphone.startError = TestError()
+        await harness.session.setMicrophoneMuted(false).value
+        await harness.session.stop()
+
+        #expect(harness.session.state == .idle)
+        #expect(!harness.systemAudio.isRunning)
         guard case .audioCapture = harness.session.failure else {
             Issue.record("Unexpected failure: \(String(describing: harness.session.failure))")
             return
