@@ -1,0 +1,16 @@
+name: mimi
+version: 1.0.0
+description: APM project for mimi
+author: koki-develop
+
+targets:
+  - claude
+
+dependencies:
+  apm:
+    - Fission-AI/OpenSpec
+  mcp: []
+
+includes: auto
+
+scripts: {}
