@@ -1,2 +1,10 @@
 # APM
 apm_modules/
+
+# Xcode
+xcuserdata/
+build/
+
+# Swift Package Manager
+.build/
+.swiftpm/
