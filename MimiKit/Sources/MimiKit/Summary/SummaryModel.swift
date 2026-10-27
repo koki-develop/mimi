@@ -8,5 +8,4 @@ public struct SummaryModel: Identifiable, Sendable, Hashable {
     public static let qwen3_6_35B_A3B = SummaryModel(id: "mlx-community/Qwen3.6-35B-A3B-4bit", displayName: "Qwen3.6 35B-A3B")
 
     public static let all: [SummaryModel] = [qwen3_5_4B, qwen3_5_9B, gemma4_12B, qwen3_6_35B_A3B]
-    public static let `default` = qwen3_5_9B
 }

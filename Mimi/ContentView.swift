@@ -4,7 +4,7 @@ import SwiftUI
 
 struct ContentView: View {
     let session: MeetingSession
-    @AppStorage(SettingsKey.summaryModelID) private var summaryModelID = SettingsDefault.summaryModelID
+    let summaryModels: SummaryModelStore
     @AppStorage(SettingsKey.isAlwaysOnTop) private var isAlwaysOnTop = SettingsDefault.isAlwaysOnTop
     @AppStorage(SettingsKey.hidesFromScreenCapture) private var hidesFromScreenCapture = SettingsDefault.hidesFromScreenCapture
     @AppStorage(SettingsKey.isTranscriptCollapsed) private var isTranscriptCollapsed = SettingsDefault.isTranscriptCollapsed
@@ -12,13 +12,13 @@ struct ContentView: View {
     @State private var collapsedContentHeight: CGFloat = 0
     @State private var headerHeight: CGFloat = 0
 
-    // Reads no session state itself, so the frequent transcript and summary updates re-render only the views that
-    // show them, not the whole window and its `WindowConfigurator`.
+    // Reads no session or model state itself, so the frequent transcript, summary, and download updates re-render only
+    // the views that show them, not the whole window and its `WindowConfigurator`.
     var body: some View {
         content
             .containerBackground(Color(nsColor: .textBackgroundColor), for: .window)
             .toolbar {
-                SessionToolbar(session: session, summaryModelID: summaryModelID)
+                SessionToolbar(session: session, summaryModels: summaryModels)
             }
             .toolbar(removing: .title)
             .background(WindowConfigurator(
@@ -65,21 +65,27 @@ struct ContentView: View {
     }
 
     private var header: some View {
-        HeaderView(session: session, isTranscriptCollapsed: $isTranscriptCollapsed)
+        HeaderView(session: session, summaryModels: summaryModels, isTranscriptCollapsed: $isTranscriptCollapsed)
             .fixedSize(horizontal: false, vertical: true)
             .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { headerHeight = $0 }
     }
 }
 
-/// The failure, the current topic, and the rule that separates them from the transcript.
+/// The failure, the missing summary model, the current topic, and the rule that separates them from the transcript.
 private struct HeaderView: View {
     let session: MeetingSession
+    let summaryModels: SummaryModelStore
     @Binding var isTranscriptCollapsed: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             if let failure = session.failure {
                 FailureBanner(failure: failure)
+                    .padding(.horizontal, 12)
+                    .padding(.top, 4)
+            }
+            if session.state == .idle, summaryModels.selectedModel == nil {
+                SummaryModelRequiredBanner()
                     .padding(.horizontal, 12)
                     .padding(.top, 4)
             }
@@ -98,7 +104,7 @@ private struct HeaderView: View {
 
 private struct SessionToolbar: ToolbarContent {
     let session: MeetingSession
-    let summaryModelID: String
+    let summaryModels: SummaryModelStore
 
     var body: some ToolbarContent {
         // Without a title, items would otherwise line up after the window controls.
@@ -120,7 +126,7 @@ private struct SessionToolbar: ToolbarContent {
         // Keeps the icon-only toggle apart from the text-labeled button, so they don't read as one action.
         ToolbarSpacer(.fixed)
         ToolbarItem {
-            SessionButton(session: session, summaryModelID: summaryModelID)
+            SessionButton(session: session, summaryModels: summaryModels)
         }
     }
 }
@@ -145,29 +151,31 @@ private struct ElapsedTimeView: View {
 
 private struct SessionButton: View {
     let session: MeetingSession
-    let summaryModelID: String
+    let summaryModels: SummaryModelStore
 
     var body: some View {
+        let isEnabled = session.canToggleRunning(summaryModel: summaryModels.selectedModel)
         Button {
-            Task { await session.toggleRunning(summaryModelID: summaryModelID) }
+            Task { await session.toggleRunning(summaryModel: summaryModels.selectedModel) }
         } label: {
             Label {
                 Text(session.toggleRunningTitle)
             } icon: {
-                icon
+                icon(isEnabled: isEnabled)
             }
             .labelStyle(.titleAndIcon)
         }
-        .disabled(!session.canToggleRunning)
+        .disabled(!isEnabled)
     }
 
     @ViewBuilder
-    private var icon: some View {
+    private func icon(isEnabled: Bool) -> some View {
         switch session.state {
         case .idle:
+            // Gray while no summary model is selected, so the button does not look ready to record.
             Image(systemName: "circle.fill")
                 .imageScale(.small)
-                .foregroundStyle(.red)
+                .foregroundStyle(isEnabled ? AnyShapeStyle(.red) : AnyShapeStyle(.tertiary))
         case .running:
             Image(systemName: "stop.fill")
                 .imageScale(.small)
@@ -179,31 +187,32 @@ private struct SessionButton: View {
     }
 }
 
-// MARK: - Failure
+// MARK: - Banners
 
 private struct FailureBanner: View {
     let failure: MeetingSession.Failure
 
     var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Image(systemName: "exclamationmark.circle.fill")
-                .foregroundStyle(.red)
-            VStack(alignment: .leading, spacing: 6) {
-                Text(failure.message)
-                if case .microphoneAccessDenied = failure {
-                    Button("システム設定を開く") {
-                        NSWorkspace.shared.open(.microphonePrivacySettings)
-                    }
-                    .controlSize(.small)
-                }
-            }
+        Banner(tone: .error, message: failure.message, detail: failure.detail, action: action)
+    }
+
+    private var action: Banner.Action? {
+        guard case .microphoneAccessDenied = failure else { return nil }
+        return Banner.Action(title: "システム設定を開く") {
+            NSWorkspace.shared.open(.microphonePrivacySettings)
         }
-        .font(.callout)
-        .padding(.horizontal, 12)
-        .padding(.vertical, 10)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.red.opacity(0.12), in: RoundedRectangle(cornerRadius: 10))
-        .help(failure.detail ?? "")
+    }
+}
+
+private struct SummaryModelRequiredBanner: View {
+    @Environment(\.openSettings) private var openSettings
+
+    var body: some View {
+        Banner(
+            tone: .warning,
+            message: SummaryModelStore.selectionRequiredMessage,
+            action: Banner.Action(title: "設定を開く") { openSettings() }
+        )
     }
 }
 
@@ -244,7 +253,7 @@ private struct TopicView: View {
         if !session.currentTopic.isEmpty {
             return session.currentTopic
         }
-        if case .loadingModel = session.summaryActivity {
+        if session.summaryActivity == .loadingModel {
             return "要約モデルを準備しています"
         }
         return "まだありません"
@@ -295,11 +304,7 @@ private struct SummaryProgressTrack: View {
                 switch activity {
                 case .idle:
                     EmptyView()
-                case let .loadingModel(progress):
-                    Capsule()
-                        .fill(.primary)
-                        .frame(width: geometry.size.width * min(max(progress, 0), 1), height: 2)
-                case .summarizing:
+                case .loadingModel, .summarizing:
                     if reduceMotion {
                         Rectangle()
                             .fill(.secondary.opacity(0.35))
@@ -320,7 +325,6 @@ private struct SummaryProgressTrack: View {
         .frame(height: 2)
         .accessibilityElement()
         .accessibilityLabel(accessibilityLabel)
-        .accessibilityValue(accessibilityValue)
         .accessibilityHidden(activity == .idle)
     }
 
@@ -337,11 +341,6 @@ private struct SummaryProgressTrack: View {
         case .loadingModel: "要約モデルを準備しています"
         case .summarizing: "要約を更新しています"
         }
-    }
-
-    private var accessibilityValue: String {
-        guard case let .loadingModel(progress) = activity else { return "" }
-        return progress.formatted(.percent.precision(.fractionLength(0)))
     }
 }
 
@@ -583,5 +582,6 @@ private extension MeetingSession.SummaryFailure {
 }
 
 #Preview {
-    ContentView(session: .live())
+    let summaryModels = SummaryModelStore.live()
+    ContentView(session: .live(summaryModels: summaryModels), summaryModels: summaryModels)
 }

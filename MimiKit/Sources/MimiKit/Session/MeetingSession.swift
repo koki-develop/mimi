@@ -26,7 +26,7 @@ public final class MeetingSession {
 
     public enum SummaryActivity: Sendable, Equatable {
         case idle
-        case loadingModel(progress: Double)
+        case loadingModel
         case summarizing
     }
 
@@ -48,6 +48,7 @@ public final class MeetingSession {
     @ObservationIgnored private let microphone: any AudioSource
     @ObservationIgnored private let systemAudio: any AudioSource
     @ObservationIgnored private let makeTranscriptionEngine: () -> any TranscriptionEngine
+    @ObservationIgnored private let summaryModels: any SummaryModelLibrary
     @ObservationIgnored private let textGeneratorProvider: any TextGeneratorProvider
     @ObservationIgnored private let summaryInterval: Duration
 
@@ -59,23 +60,28 @@ public final class MeetingSession {
     @ObservationIgnored private var microphoneReconciliation: Task<Void, Never>?
     @ObservationIgnored private var resultTasks: [Task<Void, Never>] = []
     @ObservationIgnored private var summaryTask: Task<Void, Never>?
+    /// The model borrowed from ``summaryModels`` until the session is torn down.
+    @ObservationIgnored private var summaryModelInUse: SummaryModel?
 
     public init(
         microphone: any AudioSource,
         systemAudio: any AudioSource,
         makeTranscriptionEngine: @escaping () -> any TranscriptionEngine,
+        summaryModels: any SummaryModelLibrary,
         textGeneratorProvider: any TextGeneratorProvider,
         summaryInterval: Duration
     ) {
         self.microphone = microphone
         self.systemAudio = systemAudio
         self.makeTranscriptionEngine = makeTranscriptionEngine
+        self.summaryModels = summaryModels
         self.textGeneratorProvider = textGeneratorProvider
         self.summaryInterval = summaryInterval
     }
 
-    /// Starts a session. Does nothing unless the session is idle.
-    public func start(summaryModelID: String) async {
+    /// Starts a session summarizing with `summaryModel`, which stays in use until the session stops.
+    /// Does nothing unless the session is idle. When the model cannot be used, the session runs without summaries.
+    public func start(summaryModel: SummaryModel) async {
         guard state == .idle else { return }
         state = .starting
         transcript = Transcript()
@@ -83,7 +89,16 @@ public final class MeetingSession {
         failure = nil
         summaryFailure = nil
 
-        let task = Task { [self] in await performStart(summaryModelID: summaryModelID) }
+        let summaryModelDirectory: URL?
+        do {
+            summaryModelDirectory = try summaryModels.beginUsing(summaryModel)
+            summaryModelInUse = summaryModel
+        } catch {
+            summaryModelDirectory = nil
+            summaryFailure = .modelLoading(error)
+        }
+
+        let task = Task { [self] in await performStart(summaryModelDirectory: summaryModelDirectory) }
         startTask = task
         await task.value
         startTask = nil
@@ -123,7 +138,7 @@ public final class MeetingSession {
         stopTask = nil
     }
 
-    private func performStart(summaryModelID: String) async {
+    private func performStart(summaryModelDirectory: URL?) async {
         do {
             try await startCapture()
         } catch {
@@ -138,7 +153,9 @@ public final class MeetingSession {
 
         state = .running
         runningSince = .now
-        summaryTask = Task { [self] in await runSummaryLoop(modelID: summaryModelID) }
+        if let summaryModelDirectory {
+            summaryTask = Task { [self] in await runSummaryLoop(modelDirectory: summaryModelDirectory) }
+        }
     }
 
     private func startCapture() async throws(Failure) {
@@ -236,7 +253,7 @@ public final class MeetingSession {
     }
 
     /// Records a failure that occurred while the session was starting or running, and stops the session.
-    /// While starting, ``performStart(summaryModelID:)`` checks for failures before the session runs.
+    /// While starting, ``performStart(summaryModelDirectory:)`` checks for failures before the session runs.
     private func fail(_ failure: Failure) {
         record(failure)
         if state == .running {
@@ -271,20 +288,20 @@ public final class MeetingSession {
         summaryTask?.cancel()
         await summaryTask?.value
         summaryTask = nil
+        // The model's files may be deleted only once nothing reads them.
+        if let summaryModelInUse {
+            summaryModels.endUsing(summaryModelInUse)
+            self.summaryModelInUse = nil
+        }
     }
 
-    private func runSummaryLoop(modelID: String) async {
+    private func runSummaryLoop(modelDirectory: URL) async {
         defer { summaryActivity = .idle }
 
-        summaryActivity = .loadingModel(progress: 0)
+        summaryActivity = .loadingModel
         let generator: any TextGenerator
         do {
-            generator = try await textGeneratorProvider.generator(for: modelID) { @Sendable progress in
-                Task { @MainActor [weak self] in
-                    guard let self, case .loadingModel = summaryActivity else { return }
-                    summaryActivity = .loadingModel(progress: progress)
-                }
-            }
+            generator = try await textGeneratorProvider.generator(forModelAt: modelDirectory)
         } catch {
             if !Task.isCancelled {
                 summaryFailure = .modelLoading(error)
@@ -318,11 +335,12 @@ public final class MeetingSession {
 
 extension MeetingSession {
     /// A session capturing the microphone and system audio, transcribing Japanese on device.
-    public static func live() -> MeetingSession {
+    public static func live(summaryModels: any SummaryModelLibrary) -> MeetingSession {
         MeetingSession(
             microphone: MicrophoneCapture(),
             systemAudio: SystemAudioCapture(),
             makeTranscriptionEngine: { AppleSpeechTranscriptionEngine(locale: Locale(identifier: "ja-JP")) },
+            summaryModels: summaryModels,
             textGeneratorProvider: MLXTextGeneratorProvider(),
             summaryInterval: .seconds(30)
         )

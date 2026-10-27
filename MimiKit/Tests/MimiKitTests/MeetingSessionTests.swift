@@ -152,17 +152,40 @@ private struct FakeGenerator: TextGenerator {
 
 private final class FakeGeneratorProvider: TextGeneratorProvider {
     let error: (any Error)?
-    let requestCount = Mutex(0)
+    let requestedDirectories = Mutex<[URL]>([])
 
     init(error: (any Error)? = nil) {
         self.error = error
     }
 
-    func generator(for modelID: String, progressHandler: @Sendable @escaping (Double) -> Void) async throws -> any TextGenerator {
-        requestCount.withLock { $0 += 1 }
+    var requestCount: Int {
+        requestedDirectories.withLock { $0.count }
+    }
+
+    func generator(forModelAt directory: URL) async throws -> any TextGenerator {
+        requestedDirectories.withLock { $0.append(directory) }
         if let error { throw error }
-        progressHandler(1)
         return FakeGenerator()
+    }
+}
+
+@MainActor
+private final class FakeSummaryModelLibrary: SummaryModelLibrary {
+    var availableModels: Set<SummaryModel> = Set(SummaryModel.all)
+    private(set) var useCounts: [SummaryModel: Int] = [:]
+
+    static func directory(of model: SummaryModel) -> URL {
+        URL(filePath: "/models/\(model.id)", directoryHint: .isDirectory)
+    }
+
+    func beginUsing(_ model: SummaryModel) throws -> URL {
+        guard availableModels.contains(model) else { throw TestError() }
+        useCounts[model, default: 0] += 1
+        return Self.directory(of: model)
+    }
+
+    func endUsing(_ model: SummaryModel) {
+        useCounts[model, default: 0] -= 1
     }
 }
 
@@ -189,6 +212,7 @@ private final class Harness {
     let microphone = FakeAudioSource()
     let systemAudio = FakeAudioSource()
     let provider: FakeGeneratorProvider
+    let summaryModels = FakeSummaryModelLibrary()
     let session: MeetingSession
     let engineFactory = FakeTranscriptionEngineFactory()
 
@@ -203,6 +227,7 @@ private final class Harness {
             microphone: microphone,
             systemAudio: systemAudio,
             makeTranscriptionEngine: { [engineFactory] in engineFactory.make() },
+            summaryModels: summaryModels,
             textGeneratorProvider: provider,
             summaryInterval: summaryInterval
         )
@@ -229,7 +254,7 @@ private func waitUntil(_ condition: () -> Bool) async throws {
 struct MeetingSessionTests {
     @Test func startsAndStops() async {
         let harness = Harness()
-        await harness.session.start(summaryModelID: "model")
+        await harness.session.start(summaryModel: .qwen3_5_4B)
         #expect(harness.session.state == .running)
         #expect(harness.microphone.isRunning)
         #expect(harness.systemAudio.isRunning)
@@ -248,7 +273,7 @@ struct MeetingSessionTests {
         #expect(harness.session.runningSince == nil)
 
         let before = Date.now
-        await harness.session.start(summaryModelID: "model")
+        await harness.session.start(summaryModel: .qwen3_5_4B)
         let runningSince = harness.session.runningSince
         #expect(runningSince.map { $0 >= before && $0 <= .now } == true)
 
@@ -259,15 +284,15 @@ struct MeetingSessionTests {
     @Test func runningSinceStaysUnsetWhenStartFails() async {
         let harness = Harness()
         harness.microphone.isAccessGranted = false
-        await harness.session.start(summaryModelID: "model")
+        await harness.session.start(summaryModel: .qwen3_5_4B)
         #expect(harness.session.state == .idle)
         #expect(harness.session.runningSince == nil)
     }
 
     @Test func concurrentStartsRunOneSession() async {
         let harness = Harness()
-        async let first: Void = harness.session.start(summaryModelID: "model")
-        async let second: Void = harness.session.start(summaryModelID: "model")
+        async let first: Void = harness.session.start(summaryModel: .qwen3_5_4B)
+        async let second: Void = harness.session.start(summaryModel: .qwen3_5_4B)
         _ = await (first, second)
 
         #expect(harness.session.state == .running)
@@ -279,7 +304,7 @@ struct MeetingSessionTests {
     @Test func stopWhileStartingWaitsForStart() async throws {
         let harness = Harness()
         harness.microphone.holdsAccessRequests = true
-        let start = Task { await harness.session.start(summaryModelID: "model") }
+        let start = Task { await harness.session.start(summaryModel: .qwen3_5_4B) }
         try await waitUntil { harness.microphone.hasPendingAccessRequest }
         #expect(harness.session.state == .starting)
 
@@ -295,7 +320,7 @@ struct MeetingSessionTests {
 
     @Test func concurrentStopsReturnOnceIdle() async {
         let harness = Harness()
-        await harness.session.start(summaryModelID: "model")
+        await harness.session.start(summaryModel: .qwen3_5_4B)
         let first = Task { await harness.session.stop() }
         let second = Task {
             await harness.session.stop()
@@ -309,7 +334,7 @@ struct MeetingSessionTests {
     @Test func deniedMicrophoneAccessFailsWithoutCapturing() async {
         let harness = Harness()
         harness.microphone.isAccessGranted = false
-        await harness.session.start(summaryModelID: "model")
+        await harness.session.start(summaryModel: .qwen3_5_4B)
 
         #expect(harness.session.state == .idle)
         #expect(harness.microphone.startCount == 0)
@@ -322,7 +347,7 @@ struct MeetingSessionTests {
     @Test func captureErrorTearsDownStartedComponents() async {
         let harness = Harness()
         harness.systemAudio.startError = TestError()
-        await harness.session.start(summaryModelID: "model")
+        await harness.session.start(summaryModel: .qwen3_5_4B)
 
         #expect(harness.session.state == .idle)
         #expect(!harness.microphone.isRunning)
@@ -338,7 +363,7 @@ struct MeetingSessionTests {
         // The microphone fails, then the system audio's engine fails to start.
         harness.microphone.onStart = { harness.microphone.fail() }
         harness.engineFactory.failingStartIndexes = [1]
-        await harness.session.start(summaryModelID: "model")
+        await harness.session.start(summaryModel: .qwen3_5_4B)
 
         #expect(harness.session.state == .idle)
         #expect(harness.createdEngines.map(\.isFinished) == [true, true])
@@ -352,12 +377,12 @@ struct MeetingSessionTests {
         let harness = Harness()
         // The microphone fails while the system audio is still starting, which then succeeds.
         harness.microphone.onStart = { harness.microphone.fail() }
-        await harness.session.start(summaryModelID: "model")
+        await harness.session.start(summaryModel: .qwen3_5_4B)
 
         #expect(harness.session.state == .idle)
         #expect(!harness.systemAudio.isRunning)
         #expect(harness.createdEngines.map(\.isFinished) == [true, true])
-        #expect(harness.provider.requestCount.withLock { $0 } == 0)
+        #expect(harness.provider.requestCount == 0)
         guard case .audioCapture = harness.session.failure else {
             Issue.record("Unexpected failure: \(String(describing: harness.session.failure))")
             return
@@ -366,7 +391,7 @@ struct MeetingSessionTests {
 
     @Test func transcriptionErrorStopsSession() async throws {
         let harness = Harness()
-        await harness.session.start(summaryModelID: "model")
+        await harness.session.start(summaryModel: .qwen3_5_4B)
         harness.createdEngines[1].fail()
 
         try await waitUntil { harness.session.state == .idle }
@@ -379,7 +404,7 @@ struct MeetingSessionTests {
 
     @Test func captureFailureWhileRunningStopsSession() async throws {
         let harness = Harness()
-        await harness.session.start(summaryModelID: "model")
+        await harness.session.start(summaryModel: .qwen3_5_4B)
         harness.systemAudio.fail()
 
         try await waitUntil { harness.session.state == .idle }
@@ -393,7 +418,7 @@ struct MeetingSessionTests {
 
     @Test func mutingStopsMicrophoneAndFinalizesItsSpeech() async {
         let harness = Harness()
-        await harness.session.start(summaryModelID: "model")
+        await harness.session.start(summaryModel: .qwen3_5_4B)
 
         await harness.session.setMicrophoneMuted(true).value
         #expect(harness.session.isMicrophoneMuted)
@@ -411,7 +436,7 @@ struct MeetingSessionTests {
 
     @Test func mutingTwiceIsIdempotent() async {
         let harness = Harness()
-        await harness.session.start(summaryModelID: "model")
+        await harness.session.start(summaryModel: .qwen3_5_4B)
         await harness.session.setMicrophoneMuted(true).value
         await harness.session.setMicrophoneMuted(true).value
         #expect(harness.createdEngines[0].finalizePendingCount == 1)
@@ -424,7 +449,7 @@ struct MeetingSessionTests {
 
     @Test func rapidTogglesFollowTheLastCall() async {
         let harness = Harness()
-        await harness.session.start(summaryModelID: "model")
+        await harness.session.start(summaryModel: .qwen3_5_4B)
 
         harness.session.setMicrophoneMuted(true)
         harness.session.setMicrophoneMuted(false)
@@ -440,7 +465,7 @@ struct MeetingSessionTests {
         let harness = Harness()
         harness.microphone.isAccessGranted = false
         await harness.session.setMicrophoneMuted(true).value
-        await harness.session.start(summaryModelID: "model")
+        await harness.session.start(summaryModel: .qwen3_5_4B)
         #expect(harness.session.state == .running)
         #expect(harness.session.failure == nil)
         #expect(harness.microphone.accessRequestCount == 0)
@@ -448,7 +473,7 @@ struct MeetingSessionTests {
         #expect(harness.systemAudio.isRunning)
 
         await harness.session.stop()
-        await harness.session.start(summaryModelID: "model")
+        await harness.session.start(summaryModel: .qwen3_5_4B)
         #expect(harness.microphone.startCount == 0)
         await harness.session.stop()
     }
@@ -457,7 +482,7 @@ struct MeetingSessionTests {
         let harness = Harness()
         harness.microphone.isAccessGranted = false
         await harness.session.setMicrophoneMuted(true).value
-        await harness.session.start(summaryModelID: "model")
+        await harness.session.start(summaryModel: .qwen3_5_4B)
 
         await harness.session.setMicrophoneMuted(false).value
         #expect(harness.microphone.accessRequestCount == 1)
@@ -472,7 +497,7 @@ struct MeetingSessionTests {
         let harness = Harness()
         let systemAudioEngineStart = Gate()
         harness.engineFactory.startGates[1] = systemAudioEngineStart
-        let start = Task { await harness.session.start(summaryModelID: "model") }
+        let start = Task { await harness.session.start(summaryModel: .qwen3_5_4B) }
         try await waitUntil { harness.microphone.isRunning }
 
         await harness.session.setMicrophoneMuted(true).value
@@ -490,7 +515,7 @@ struct MeetingSessionTests {
     @Test func mutingWhileAccessIsRequestedKeepsMicrophoneOff() async throws {
         let harness = Harness()
         harness.microphone.holdsAccessRequests = true
-        let start = Task { await harness.session.start(summaryModelID: "model") }
+        let start = Task { await harness.session.start(summaryModel: .qwen3_5_4B) }
         try await waitUntil { harness.microphone.hasPendingAccessRequest }
 
         harness.session.setMicrophoneMuted(true)
@@ -506,7 +531,7 @@ struct MeetingSessionTests {
     @Test func accessRequestFromPreviousSessionDoesNotAffectNextSession() async throws {
         let harness = Harness()
         await harness.session.setMicrophoneMuted(true).value
-        await harness.session.start(summaryModelID: "model")
+        await harness.session.start(summaryModel: .qwen3_5_4B)
 
         // Unmuting asks for access, and the session stops while the request is pending.
         harness.microphone.holdsAccessRequests = true
@@ -515,7 +540,7 @@ struct MeetingSessionTests {
         await harness.session.stop()
 
         // The next session waits for the pending request; denying it must not fail the next session.
-        let start = Task { await harness.session.start(summaryModelID: "model") }
+        let start = Task { await harness.session.start(summaryModel: .qwen3_5_4B) }
         try await waitUntil { harness.session.state == .starting }
         harness.microphone.holdsAccessRequests = false
         harness.microphone.answerPendingAccessRequest(granted: false)
@@ -530,7 +555,7 @@ struct MeetingSessionTests {
 
     @Test func unmuteFailureStopsSession() async {
         let harness = Harness()
-        await harness.session.start(summaryModelID: "model")
+        await harness.session.start(summaryModel: .qwen3_5_4B)
         await harness.session.setMicrophoneMuted(true).value
 
         harness.microphone.startError = TestError()
@@ -547,7 +572,7 @@ struct MeetingSessionTests {
 
     @Test func resultsAreAttributedToTheirSpeakers() async throws {
         let harness = Harness()
-        await harness.session.start(summaryModelID: "model")
+        await harness.session.start(summaryModel: .qwen3_5_4B)
         harness.createdEngines[0].emit(result("自分の発言", 0))
         harness.createdEngines[1].emit(result("相手の発言", 1))
 
@@ -558,7 +583,7 @@ struct MeetingSessionTests {
 
     @Test func stopAppliesResultsDeliveredWhileFinishing() async {
         let harness = Harness()
-        await harness.session.start(summaryModelID: "model")
+        await harness.session.start(summaryModel: .qwen3_5_4B)
         harness.createdEngines[0].deliverOnFinish(result("最後の発言", 0))
 
         await harness.session.stop()
@@ -567,7 +592,7 @@ struct MeetingSessionTests {
 
     @Test func summarizesCurrentTopic() async throws {
         let harness = Harness(summaryInterval: .milliseconds(10))
-        await harness.session.start(summaryModelID: "model")
+        await harness.session.start(summaryModel: .qwen3_5_4B)
         harness.createdEngines[1].emit(result("議題は予算です", 0))
 
         try await waitUntil { !harness.session.currentTopic.isEmpty }
@@ -578,7 +603,7 @@ struct MeetingSessionTests {
 
     @Test func modelLoadingFailureKeepsTranscribing() async throws {
         let harness = Harness(provider: FakeGeneratorProvider(error: TestError()))
-        await harness.session.start(summaryModelID: "model")
+        await harness.session.start(summaryModel: .qwen3_5_4B)
 
         try await waitUntil { harness.session.summaryFailure != nil }
         #expect(harness.session.state == .running)
@@ -589,14 +614,61 @@ struct MeetingSessionTests {
         await harness.session.stop()
     }
 
+    @Test func summaryModelIsInUseUntilStopped() async throws {
+        let harness = Harness(summaryInterval: .milliseconds(10))
+        await harness.session.start(summaryModel: .qwen3_5_9B)
+        #expect(harness.summaryModels.useCounts[.qwen3_5_9B] == 1)
+
+        try await waitUntil { harness.provider.requestCount == 1 }
+        #expect(harness.provider.requestedDirectories.withLock { $0 } == [FakeSummaryModelLibrary.directory(of: .qwen3_5_9B)])
+
+        await harness.session.stop()
+        #expect(harness.summaryModels.useCounts[.qwen3_5_9B] == 0)
+    }
+
+    @Test func summaryModelIsReleasedWhenStartFails() async {
+        let harness = Harness()
+        harness.systemAudio.startError = TestError()
+        await harness.session.start(summaryModel: .qwen3_5_4B)
+
+        #expect(harness.session.state == .idle)
+        #expect(harness.summaryModels.useCounts[.qwen3_5_4B] == 0)
+    }
+
+    @Test func summaryModelIsReleasedWhenSessionStopsUnexpectedly() async throws {
+        let harness = Harness()
+        await harness.session.start(summaryModel: .qwen3_5_4B)
+        harness.systemAudio.fail()
+
+        try await waitUntil { harness.session.state == .idle }
+        #expect(harness.summaryModels.useCounts[.qwen3_5_4B] == 0)
+    }
+
+    @Test func unavailableSummaryModelKeepsTranscribing() async {
+        let harness = Harness()
+        harness.summaryModels.availableModels = []
+        await harness.session.start(summaryModel: .qwen3_5_4B)
+
+        #expect(harness.session.state == .running)
+        #expect(harness.session.summaryActivity == .idle)
+        #expect(harness.provider.requestCount == 0)
+        guard case .modelLoading = harness.session.summaryFailure else {
+            Issue.record("Unexpected failure: \(String(describing: harness.session.summaryFailure))")
+            return
+        }
+
+        await harness.session.stop()
+        #expect(harness.summaryModels.useCounts[.qwen3_5_4B] == nil)
+    }
+
     @Test func restartClearsPreviousSession() async throws {
         let harness = Harness()
         harness.systemAudio.startError = TestError()
-        await harness.session.start(summaryModelID: "model")
+        await harness.session.start(summaryModel: .qwen3_5_4B)
         #expect(harness.session.failure != nil)
 
         harness.systemAudio.startError = nil
-        await harness.session.start(summaryModelID: "model")
+        await harness.session.start(summaryModel: .qwen3_5_4B)
         #expect(harness.session.state == .running)
         #expect(harness.session.failure == nil)
         #expect(harness.session.transcript.lines.isEmpty)

@@ -1,8 +1,6 @@
 import AppKit
-import MimiKit
 
 enum SettingsKey {
-    static let summaryModelID = "summaryModelID"
     static let isAlwaysOnTop = "isAlwaysOnTop"
     static let hidesFromScreenCapture = "hidesFromScreenCapture"
     static let theme = "theme"
@@ -13,7 +11,6 @@ enum SettingsKey {
 
 /// The value of each setting until the user changes it. Every reader of a setting uses these.
 enum SettingsDefault {
-    static let summaryModelID = SummaryModel.default.id
     static let isAlwaysOnTop = true
     static let hidesFromScreenCapture = true
     static let theme = AppTheme.system

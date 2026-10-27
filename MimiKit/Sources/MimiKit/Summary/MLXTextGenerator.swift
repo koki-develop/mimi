@@ -10,15 +10,10 @@ final class MLXTextGenerator: TextGenerator {
         self.container = container
     }
 
-    static func load(
-        modelID: String,
-        progressHandler: @Sendable @escaping (Double) -> Void
-    ) async throws -> MLXTextGenerator {
+    static func load(from directory: URL) async throws -> MLXTextGenerator {
         let container = try await LLMModelFactory.shared.loadContainer(
-            from: HubDownloader(),
-            using: TransformersTokenizerLoader(),
-            configuration: ModelConfiguration(id: modelID),
-            progressHandler: { progress in progressHandler(progress.fractionCompleted) }
+            from: directory,
+            using: TransformersTokenizerLoader()
         )
         return MLXTextGenerator(container: container)
     }
@@ -37,7 +32,7 @@ final class MLXTextGenerator: TextGenerator {
 
 /// Keeps at most one model in memory, releasing it before loading a different one.
 public actor MLXTextGeneratorProvider: TextGeneratorProvider {
-    private var loaded: (modelID: String, generator: MLXTextGenerator)?
+    private var loaded: (directory: URL, generator: MLXTextGenerator)?
 
     public init() {
         // Bounds the buffer cache MLX keeps between evaluations, as recommended for LLM inference.
@@ -45,18 +40,15 @@ public actor MLXTextGeneratorProvider: TextGeneratorProvider {
     }
 
     /// Calls must not overlap.
-    public func generator(
-        for modelID: String,
-        progressHandler: @Sendable @escaping (Double) -> Void
-    ) async throws -> any TextGenerator {
-        if let loaded, loaded.modelID == modelID {
+    public func generator(forModelAt directory: URL) async throws -> any TextGenerator {
+        if let loaded, loaded.directory == directory {
             return loaded.generator
         }
         loaded = nil
         Memory.clearCache()
 
-        let generator = try await MLXTextGenerator.load(modelID: modelID, progressHandler: progressHandler)
-        loaded = (modelID, generator)
+        let generator = try await MLXTextGenerator.load(from: directory)
+        loaded = (directory, generator)
         return generator
     }
 }
