@@ -31,10 +31,11 @@ public final class MeetingSession {
     }
 
     public private(set) var state = State.idle
+    /// When the session started running. Set while the session is running or stopping.
+    public private(set) var runningSince: Date?
     public private(set) var transcript = Transcript()
     public private(set) var currentTopic = ""
     public private(set) var summaryActivity = SummaryActivity.idle
-    public private(set) var lastSummaryDuration: Duration?
     /// The reason the last session failed to start or stopped unexpectedly.
     public private(set) var failure: Failure?
     public private(set) var summaryFailure: SummaryFailure?
@@ -79,7 +80,6 @@ public final class MeetingSession {
         state = .starting
         transcript = Transcript()
         currentTopic = ""
-        lastSummaryDuration = nil
         failure = nil
         summaryFailure = nil
 
@@ -116,6 +116,7 @@ public final class MeetingSession {
         let task = Task { [self] in
             await tearDown()
             state = .idle
+            runningSince = nil
         }
         stopTask = task
         await task.value
@@ -136,6 +137,7 @@ public final class MeetingSession {
         }
 
         state = .running
+        runningSince = .now
         summaryTask = Task { [self] in await runSummaryLoop(modelID: summaryModelID) }
     }
 
@@ -292,7 +294,6 @@ public final class MeetingSession {
         summaryActivity = .idle
 
         let summarizer = TopicSummarizer(generator: generator)
-        let clock = ContinuousClock()
         while !Task.isCancelled {
             do {
                 try await Task.sleep(for: summaryInterval)
@@ -301,11 +302,9 @@ public final class MeetingSession {
             }
 
             summaryActivity = .summarizing
-            let startedAt = clock.now
             do {
                 if let topic = try await summarizer.update(with: transcript.finalLines) {
                     currentTopic = topic
-                    lastSummaryDuration = startedAt.duration(to: clock.now)
                     summaryFailure = nil
                 }
             } catch {

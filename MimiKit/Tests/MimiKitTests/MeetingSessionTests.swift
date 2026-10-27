@@ -243,6 +243,27 @@ struct MeetingSessionTests {
         #expect(harness.session.failure == nil)
     }
 
+    @Test func runningSinceCoversTheRunningSession() async {
+        let harness = Harness()
+        #expect(harness.session.runningSince == nil)
+
+        let before = Date.now
+        await harness.session.start(summaryModelID: "model")
+        let runningSince = harness.session.runningSince
+        #expect(runningSince.map { $0 >= before && $0 <= .now } == true)
+
+        await harness.session.stop()
+        #expect(harness.session.runningSince == nil)
+    }
+
+    @Test func runningSinceStaysUnsetWhenStartFails() async {
+        let harness = Harness()
+        harness.microphone.isAccessGranted = false
+        await harness.session.start(summaryModelID: "model")
+        #expect(harness.session.state == .idle)
+        #expect(harness.session.runningSince == nil)
+    }
+
     @Test func concurrentStartsRunOneSession() async {
         let harness = Harness()
         async let first: Void = harness.session.start(summaryModelID: "model")
@@ -551,7 +572,6 @@ struct MeetingSessionTests {
 
         try await waitUntil { !harness.session.currentTopic.isEmpty }
         #expect(harness.session.currentTopic == "話題の要約")
-        #expect(harness.session.lastSummaryDuration != nil)
         await harness.session.stop()
         #expect(harness.session.summaryActivity == .idle)
     }

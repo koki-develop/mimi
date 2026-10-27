@@ -8,10 +8,18 @@ struct MimiApp: App {
         Window("Mimi", id: "main") {
             ContentView(session: appDelegate.session)
         }
-        .defaultSize(width: 380, height: 560)
+        .defaultSize(MainWindow.defaultSize)
+        .windowResizability(.contentMinSize)
+        .commands {
+            MeetingCommands(session: appDelegate.session)
+        }
 
         Settings {
             SettingsView()
         }
     }
+}
+
+enum MainWindow {
+    static let defaultSize = CGSize(width: 380, height: 560)
 }
