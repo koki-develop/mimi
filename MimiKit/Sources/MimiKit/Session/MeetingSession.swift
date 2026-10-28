@@ -24,6 +24,13 @@ public final class MeetingSession {
         case summarization(any Error)
     }
 
+    /// Where the microphone audio of a session goes: through echo cancellation, which removes the system audio the
+    /// microphone picks up, to the engine transcribing it.
+    private struct MicrophonePath {
+        let engine: any TranscriptionEngine
+        let echoCancellation: EchoCancellationPipeline
+    }
+
     public enum SummaryActivity: Sendable, Equatable {
         case idle
         case loadingModel
@@ -48,6 +55,7 @@ public final class MeetingSession {
     @ObservationIgnored private let microphone: any AudioSource
     @ObservationIgnored private let systemAudio: any AudioSource
     @ObservationIgnored private let makeTranscriptionEngine: () -> any TranscriptionEngine
+    @ObservationIgnored private let makeEchoCanceller: (_ sampleRate: Int) throws -> any EchoCanceller
     @ObservationIgnored private let summaryModels: any SummaryModelLibrary
     @ObservationIgnored private let textGeneratorProvider: any TextGeneratorProvider
     @ObservationIgnored private let summaryInterval: Duration
@@ -55,7 +63,7 @@ public final class MeetingSession {
     @ObservationIgnored private var startTask: Task<Void, Never>?
     @ObservationIgnored private var stopTask: Task<Void, Never>?
     @ObservationIgnored private var engines: [any TranscriptionEngine] = []
-    @ObservationIgnored private var microphoneEngine: (any TranscriptionEngine)?
+    @ObservationIgnored private var microphonePath: MicrophonePath?
     @ObservationIgnored private var isMicrophoneCapturing = false
     @ObservationIgnored private var microphoneReconciliation: Task<Void, Never>?
     @ObservationIgnored private var resultTasks: [Task<Void, Never>] = []
@@ -63,10 +71,12 @@ public final class MeetingSession {
     /// The model borrowed from ``summaryModels`` until the session is torn down.
     @ObservationIgnored private var summaryModelInUse: SummaryModel?
 
+    /// `makeEchoCanceller` creates a canceller for mono audio at the given sample rate, once per session.
     public init(
         microphone: any AudioSource,
         systemAudio: any AudioSource,
         makeTranscriptionEngine: @escaping () -> any TranscriptionEngine,
+        makeEchoCanceller: @escaping (_ sampleRate: Int) throws -> any EchoCanceller,
         summaryModels: any SummaryModelLibrary,
         textGeneratorProvider: any TextGeneratorProvider,
         summaryInterval: Duration
@@ -74,6 +84,7 @@ public final class MeetingSession {
         self.microphone = microphone
         self.systemAudio = systemAudio
         self.makeTranscriptionEngine = makeTranscriptionEngine
+        self.makeEchoCanceller = makeEchoCanceller
         self.summaryModels = summaryModels
         self.textGeneratorProvider = textGeneratorProvider
         self.summaryInterval = summaryInterval
@@ -161,12 +172,41 @@ public final class MeetingSession {
     private func startCapture() async throws(Failure) {
         let timelineOrigin = mach_absolute_time()
 
-        microphoneEngine = try await startEngine(for: .me, timelineOrigin: timelineOrigin)
+        let microphonePath = try makeMicrophonePath(feeding: try await startEngine(for: .me, timelineOrigin: timelineOrigin))
+        self.microphonePath = microphonePath
         // Starts the microphone unless muted. Failures are recorded and checked by `performStart`.
         await reconcileMicrophone().value
 
         let systemAudioEngine = try await startEngine(for: .others, timelineOrigin: timelineOrigin)
-        try start(systemAudio, feeding: systemAudioEngine, meter: systemAudioLevel)
+        let meter = systemAudioLevel
+        let echoCancellation = microphonePath.echoCancellation
+        try start(systemAudio) { @Sendable buffer, hostTime in
+            systemAudioEngine.append(buffer, hostTime: hostTime)
+            meter.update(with: buffer)
+            echoCancellation.appendReference(buffer, hostTime: hostTime)
+        }
+    }
+
+    /// The microphone audio reaches `engine` and ``microphoneLevel`` through the echo cancellation of the result.
+    private func makeMicrophonePath(feeding engine: any TranscriptionEngine) throws(Failure) -> MicrophonePath {
+        let canceller: any EchoCanceller
+        do {
+            canceller = try makeEchoCanceller(EchoCancellationPipeline.sampleRate)
+        } catch {
+            throw .audioCapture(error)
+        }
+        let meter = microphoneLevel
+        let echoCancellation = EchoCancellationPipeline(
+            canceller: canceller,
+            onOutput: { @Sendable buffer, hostTime in
+                engine.append(buffer, hostTime: hostTime)
+                meter.update(with: buffer)
+            },
+            onFailure: { [weak self] error in
+                Task { @MainActor in self?.fail(.audioCapture(error)) }
+            }
+        )
+        return MicrophonePath(engine: engine, echoCancellation: echoCancellation)
     }
 
     private func startEngine(for speaker: Speaker, timelineOrigin: UInt64) async throws(Failure) -> any TranscriptionEngine {
@@ -180,21 +220,17 @@ public final class MeetingSession {
         return engine
     }
 
+    /// Delivers the microphone audio still held for echo cancellation, so that the engine can finalize it.
     private func stopMicrophone() {
         microphone.stop()
+        microphonePath?.echoCancellation.flush()
         isMicrophoneCapturing = false
         microphoneLevel.reset()
     }
 
-    private func start(_ source: any AudioSource, feeding engine: any TranscriptionEngine, meter: AudioLevelMeter) throws(Failure) {
+    private func start(_ source: any AudioSource, onBuffer: @escaping AudioBufferHandler) throws(Failure) {
         do {
-            try source.start(
-                onBuffer: { @Sendable buffer, hostTime in
-                    engine.append(buffer, hostTime: hostTime)
-                    meter.update(with: buffer)
-                },
-                onFailure: { [weak self] error in self?.fail(.audioCapture(error)) }
-            )
+            try source.start(onBuffer: onBuffer, onFailure: { [weak self] error in self?.fail(.audioCapture(error)) })
         } catch {
             throw .audioCapture(error)
         }
@@ -213,14 +249,14 @@ public final class MeetingSession {
     }
 
     private func applyMicrophoneMute() async {
-        guard isCaptureActive, let microphoneEngine else { return }
+        guard isCaptureActive, let microphonePath else { return }
         if isMicrophoneMuted, isMicrophoneCapturing {
             stopMicrophone()
-            await microphoneEngine.finalizePending()
+            await microphonePath.engine.finalizePending()
         } else if !isMicrophoneMuted, !isMicrophoneCapturing {
             let isAccessGranted = await microphone.requestAccess()
             // The session may have stopped, or a new one started, while access was being requested.
-            guard isCaptureActive, self.microphoneEngine === microphoneEngine else { return }
+            guard isCaptureActive, self.microphonePath?.engine === microphonePath.engine else { return }
             guard isAccessGranted else {
                 fail(.microphoneAccessDenied)
                 return
@@ -228,7 +264,10 @@ public final class MeetingSession {
             // Muting while access was being requested takes precedence.
             guard !isMicrophoneMuted else { return }
             do {
-                try start(microphone, feeding: microphoneEngine, meter: microphoneLevel)
+                let echoCancellation = microphonePath.echoCancellation
+                try start(microphone) { @Sendable buffer, hostTime in
+                    echoCancellation.appendCapture(buffer, hostTime: hostTime)
+                }
                 isMicrophoneCapturing = true
             } catch {
                 fail(error)
@@ -277,7 +316,7 @@ public final class MeetingSession {
             }
         }
         engines = []
-        microphoneEngine = nil
+        microphonePath = nil
         for task in resultTasks {
             await task.value
         }
@@ -340,6 +379,7 @@ extension MeetingSession {
             microphone: MicrophoneCapture(),
             systemAudio: SystemAudioCapture(),
             makeTranscriptionEngine: { AppleSpeechTranscriptionEngine(locale: Locale(identifier: "ja-JP")) },
+            makeEchoCanceller: { try WebRTCEchoCanceller(sampleRate: $0) },
             summaryModels: summaryModels,
             textGeneratorProvider: MLXTextGeneratorProvider(),
             summaryInterval: .seconds(30)

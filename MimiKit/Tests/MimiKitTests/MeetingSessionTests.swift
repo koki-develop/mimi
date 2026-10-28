@@ -31,6 +31,7 @@ private final class FakeAudioSource: AudioSource {
         pendingAccessRequest = nil
     }
 
+    private var onBuffer: AudioBufferHandler?
     private var onFailure: ((any Error) -> Void)?
 
     /// Called once the source has started.
@@ -40,13 +41,20 @@ private final class FakeAudioSource: AudioSource {
         startCount += 1
         if let startError { throw startError }
         isRunning = true
+        self.onBuffer = onBuffer
         self.onFailure = onFailure
         onStart()
     }
 
     func stop() {
         isRunning = false
+        onBuffer = nil
         onFailure = nil
+    }
+
+    /// Delivers captured audio as the running source would.
+    func capture(_ buffer: AVAudioPCMBuffer, hostTime: UInt64) {
+        onBuffer?(buffer, hostTime)
     }
 
     /// Simulates capture stopping unexpectedly, e.g. when the device cannot be resumed after a change.
@@ -82,11 +90,16 @@ private final class Gate: Sendable {
 }
 
 private final class FakeTranscriptionEngine: TranscriptionEngine {
+    enum Event: Equatable {
+        case append(frames: Int, hostTime: UInt64)
+        case finalizePending
+    }
+
     private struct State {
         var continuation: AsyncThrowingStream<TranscriptionResult, any Error>.Continuation?
         var resultsOnFinish: [TranscriptionResult] = []
-        var finalizePendingCount = 0
         var isFinished = false
+        var events: [Event] = []
     }
 
     private let state = Mutex(State())
@@ -103,7 +116,18 @@ private final class FakeTranscriptionEngine: TranscriptionEngine {
     }
 
     var finalizePendingCount: Int {
-        state.withLock { $0.finalizePendingCount }
+        events.filter { $0 == .finalizePending }.count
+    }
+
+    var events: [Event] {
+        state.withLock { $0.events }
+    }
+
+    var appendedFrameCount: Int {
+        events.reduce(0) { total, event in
+            guard case let .append(frames, _) = event else { return total }
+            return total + frames
+        }
     }
 
     func start(timelineOrigin: UInt64) async throws -> AsyncThrowingStream<TranscriptionResult, any Error> {
@@ -114,10 +138,12 @@ private final class FakeTranscriptionEngine: TranscriptionEngine {
         return stream
     }
 
-    func append(_ buffer: AVAudioPCMBuffer, hostTime: UInt64) {}
+    func append(_ buffer: AVAudioPCMBuffer, hostTime: UInt64) {
+        state.withLock { $0.events.append(.append(frames: Int(buffer.frameLength), hostTime: hostTime)) }
+    }
 
     func finalizePending() async {
-        state.withLock { $0.finalizePendingCount += 1 }
+        state.withLock { $0.events.append(.finalizePending) }
     }
 
     func finish() async {
@@ -207,6 +233,41 @@ private final class FakeTranscriptionEngineFactory {
     }
 }
 
+private final class EchoCancellerFactory: Sendable {
+    private struct State {
+        var error: (any Error)?
+        var processingError: (any Error)?
+        var sampleRates: [Int] = []
+    }
+
+    private let state = Mutex(State())
+
+    /// Thrown when creating a canceller.
+    var error: (any Error)? {
+        get { state.withLock { $0.error } }
+        set { state.withLock { $0.error = newValue } }
+    }
+
+    /// Thrown by the cancellers created when processing audio.
+    var processingError: (any Error)? {
+        get { state.withLock { $0.processingError } }
+        set { state.withLock { $0.processingError = newValue } }
+    }
+
+    var sampleRates: [Int] {
+        state.withLock { $0.sampleRates }
+    }
+
+    func make(sampleRate: Int) throws -> any EchoCanceller {
+        let processingError = try state.withLock { state in
+            state.sampleRates.append(sampleRate)
+            if let error = state.error { throw error }
+            return state.processingError
+        }
+        return RecordingEchoCanceller(error: processingError)
+    }
+}
+
 @MainActor
 private final class Harness {
     let microphone = FakeAudioSource()
@@ -215,6 +276,7 @@ private final class Harness {
     let summaryModels = FakeSummaryModelLibrary()
     let session: MeetingSession
     let engineFactory = FakeTranscriptionEngineFactory()
+    let echoCancellerFactory = EchoCancellerFactory()
 
     /// Engines in creation order: the microphone's first, then the system audio's.
     var createdEngines: [FakeTranscriptionEngine] {
@@ -227,6 +289,7 @@ private final class Harness {
             microphone: microphone,
             systemAudio: systemAudio,
             makeTranscriptionEngine: { [engineFactory] in engineFactory.make() },
+            makeEchoCanceller: { [echoCancellerFactory] in try echoCancellerFactory.make(sampleRate: $0) },
             summaryModels: summaryModels,
             textGeneratorProvider: provider,
             summaryInterval: summaryInterval
@@ -673,5 +736,68 @@ struct MeetingSessionTests {
         #expect(harness.session.failure == nil)
         #expect(harness.session.transcript.lines.isEmpty)
         await harness.session.stop()
+    }
+
+    @Test func microphoneAudioReachesItsEngineThroughEchoCancellation() async {
+        let harness = Harness()
+        await harness.session.start(summaryModel: .qwen3_5_4B)
+        #expect(harness.echoCancellerFactory.sampleRates == [16000])
+
+        harness.microphone.capture(makeBuffer([Float](repeating: 0.1, count: 1600)), hostTime: hostTime(10))
+        harness.systemAudio.capture(makeBuffer([Float](repeating: 0.2, count: 512), sampleRate: 48000), hostTime: hostTime(10))
+        // The system audio is transcribed as captured.
+        #expect(harness.createdEngines[1].events == [.append(frames: 512, hostTime: hostTime(10))])
+
+        await harness.session.stop()
+        // The microphone audio held for its reference is delivered before the engine finishes, from where it was captured.
+        #expect(harness.createdEngines[0].appendedFrameCount == 1600)
+        guard case let .append(_, firstHostTime) = harness.createdEngines[0].events.first else {
+            Issue.record("No microphone audio was appended")
+            return
+        }
+        #expect(abs(AVAudioTime.seconds(forHostTime: firstHostTime) - 10) < 0.001)
+    }
+
+    @Test func mutingDeliversHeldMicrophoneAudioBeforeFinalizing() async {
+        let harness = Harness()
+        await harness.session.start(summaryModel: .qwen3_5_4B)
+        harness.microphone.capture(makeBuffer([Float](repeating: 0.1, count: 1600)), hostTime: hostTime(10))
+        #expect(harness.createdEngines[0].events.isEmpty)
+
+        await harness.session.setMicrophoneMuted(true).value
+        let events = harness.createdEngines[0].events
+        #expect(events.last == .finalizePending)
+        #expect(harness.createdEngines[0].appendedFrameCount == 1600)
+        await harness.session.stop()
+    }
+
+    @Test func echoCancellationFailureStopsSession() async throws {
+        let harness = Harness()
+        harness.echoCancellerFactory.processingError = TestError()
+        await harness.session.start(summaryModel: .qwen3_5_4B)
+        harness.microphone.capture(makeBuffer([Float](repeating: 0.1, count: 8000)), hostTime: hostTime(10))
+
+        try await waitUntil { harness.session.state == .idle }
+        #expect(!harness.microphone.isRunning)
+        #expect(harness.createdEngines.map(\.isFinished) == [true, true])
+        guard case .audioCapture = harness.session.failure else {
+            Issue.record("Unexpected failure: \(String(describing: harness.session.failure))")
+            return
+        }
+    }
+
+    @Test func echoCancellerFailureFailsStart() async {
+        let harness = Harness()
+        harness.echoCancellerFactory.error = TestError()
+        await harness.session.start(summaryModel: .qwen3_5_4B)
+
+        #expect(harness.session.state == .idle)
+        #expect(!harness.microphone.isRunning)
+        #expect(!harness.systemAudio.isRunning)
+        #expect(harness.createdEngines.map(\.isFinished) == [true])
+        guard case .audioCapture = harness.session.failure else {
+            Issue.record("Unexpected failure: \(String(describing: harness.session.failure))")
+            return
+        }
     }
 }
