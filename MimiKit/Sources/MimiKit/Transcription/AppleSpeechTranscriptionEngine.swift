@@ -28,7 +28,7 @@ public final class AppleSpeechTranscriptionEngine: TranscriptionEngine {
         let inputs: AsyncStream<AnalyzerInput>.Continuation
         let results: AsyncThrowingStream<TranscriptionResult, any Error>.Continuation
         var timeline: AnalyzerTimeline
-        var converter: AVAudioConverter?
+        var converter: AudioStreamConverter?
 
         mutating func append(_ buffer: AVAudioPCMBuffer, hostTime: UInt64) throws(EngineError) {
             let captureTime = AVAudioTime.seconds(forHostTime: hostTime)
@@ -39,62 +39,32 @@ public final class AppleSpeechTranscriptionEngine: TranscriptionEngine {
             var runStart: TimeInterval?
             if isDiscontinuous || converter?.inputFormat != buffer.format {
                 try flushConverter()
-                guard let converter = AVAudioConverter(from: buffer.format, to: analyzerFormat) else {
-                    throw .audioConversionFailed("\(buffer.format) to \(analyzerFormat) is not supported")
-                }
-                converter.downmix = true
-                self.converter = converter
+                converter = try Self.converting(AudioStreamConverter(from: buffer.format, to: analyzerFormat))
                 runStart = timeline.startTime(forRunCapturedAt: captureTime)
             }
-            guard let converter, let converted = try convert(buffer, using: converter) else { return }
+            guard let converter, let converted = try Self.converting(converter.convert(buffer)) else { return }
             yield(converted, start: runStart)
         }
 
         mutating func flushConverter() throws(EngineError) {
-            if let converter, let remaining = try convert(nil, using: converter) {
+            if let converter, let remaining = try Self.converting(converter.drain()) {
                 yield(remaining, start: nil)
             }
             converter = nil
+        }
+
+        private static func converting<T>(_ body: @autoclosure () throws(AudioConversionError) -> T) throws(EngineError) -> T {
+            do {
+                return try body()
+            } catch {
+                throw .audioConversionFailed(error.errorDescription ?? "Unknown error")
+            }
         }
 
         private mutating func yield(_ buffer: AVAudioPCMBuffer, start: TimeInterval?) {
             let bufferStartTime = start.map { CMTime(seconds: $0, preferredTimescale: CMTimeScale(analyzerFormat.sampleRate)) }
             inputs.yield(AnalyzerInput(buffer: buffer, bufferStartTime: bufferStartTime))
             timeline.registerAnalyzerInput(start: start, duration: Double(buffer.frameLength) / analyzerFormat.sampleRate)
-        }
-
-        /// Converts `buffer`, or drains the samples buffered inside `converter` when `buffer` is `nil`.
-        /// Returns `nil` when the converter produced no samples.
-        private func convert(_ buffer: AVAudioPCMBuffer?, using converter: AVAudioConverter) throws(EngineError) -> AVAudioPCMBuffer? {
-            let ratio = converter.outputFormat.sampleRate / converter.inputFormat.sampleRate
-            let inputFrames = buffer.map { Double($0.frameLength) } ?? 0
-            // Leaves room for samples the converter holds back from earlier calls.
-            let capacity = AVAudioFrameCount((inputFrames * ratio).rounded(.up)) + 1024
-            guard let output = AVAudioPCMBuffer(pcmFormat: converter.outputFormat, frameCapacity: capacity) else {
-                throw .audioConversionFailed("Could not allocate an output buffer of \(capacity) frames")
-            }
-
-            // The input block is invoked synchronously within `convert(to:error:withInputFrom:)`.
-            nonisolated(unsafe) let input = buffer
-            nonisolated(unsafe) var consumed = false
-            var error: NSError?
-            let status = converter.convert(to: output, error: &error) { _, inputStatus in
-                guard let input else {
-                    inputStatus.pointee = .endOfStream
-                    return nil
-                }
-                if consumed {
-                    inputStatus.pointee = .noDataNow
-                    return nil
-                }
-                consumed = true
-                inputStatus.pointee = .haveData
-                return input
-            }
-            if status == .error {
-                throw .audioConversionFailed(error?.localizedDescription ?? "Unknown error")
-            }
-            return output.frameLength > 0 ? output : nil
         }
     }
 
