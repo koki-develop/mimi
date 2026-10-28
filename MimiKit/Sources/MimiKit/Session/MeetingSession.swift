@@ -157,6 +157,8 @@ public final class MeetingSession {
         }
         // Also covers a source or engine that failed asynchronously while the other one was still starting.
         guard failure == nil else {
+            // Ends capture being active, so that nothing restarts the microphone while the session is torn down.
+            state = .stopping
             await tearDown()
             state = .idle
             return
