@@ -1,0 +1,4 @@
+module CEchoCanceller {
+    header "echo_canceller.h"
+    export *
+}

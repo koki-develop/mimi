@@ -2,8 +2,23 @@
 apm = "0.31.0"
 betterleaks = "1.8.1"
 lefthook = "2.1.14"
+meson = "1.12.1"
+ninja = "1.13.2"
 node = "24.22.1"
 "npm:@fission-ai/openspec" = "1.14.2"
+uv = "0.13.5"
 
 [tasks.bootstrap]
+depends = ["build:echo-canceller"]
 run = ["lefthook install"]
+
+[tasks."build:echo-canceller"]
+description = "Build the echo canceller XCFramework that MimiKit links"
+file = "MimiKit/Native/EchoCanceller/build.sh"
+sources = [
+  "MimiKit/Native/EchoCanceller/build.sh",
+  "MimiKit/Native/EchoCanceller/echo_canceller.cc",
+  "MimiKit/Native/EchoCanceller/exported_symbols.txt",
+  "MimiKit/Native/EchoCanceller/include/*",
+]
+outputs = ["MimiKit/Native/EchoCanceller/build/CEchoCanceller.xcframework/Info.plist"]

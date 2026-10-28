@@ -21,13 +21,21 @@ let package = Package(
         .target(
             name: "MimiKit",
             dependencies: [
+                "CEchoCanceller",
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXLLM", package: "mlx-swift-lm"),
                 .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
                 .product(name: "HuggingFace", package: "swift-huggingface"),
                 .product(name: "Tokenizers", package: "swift-transformers"),
+            ],
+            // CEchoCanceller is a static library of C++ code.
+            linkerSettings: [
+                .linkedLibrary("c++"),
+                .linkedFramework("CoreFoundation"),
             ]
         ),
+        // Built by `mise run build:echo-canceller`.
+        .binaryTarget(name: "CEchoCanceller", path: "Native/EchoCanceller/build/CEchoCanceller.xcframework"),
         .testTarget(name: "MimiKitTests", dependencies: ["MimiKit"]),
     ]
 )

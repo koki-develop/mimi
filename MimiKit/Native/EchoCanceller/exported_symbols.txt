@@ -1,0 +1,4 @@
+_mimi_echo_canceller_create
+_mimi_echo_canceller_destroy
+_mimi_echo_canceller_analyze_render
+_mimi_echo_canceller_process_capture
