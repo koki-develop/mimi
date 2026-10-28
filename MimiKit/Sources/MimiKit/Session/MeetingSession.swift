@@ -419,7 +419,7 @@ public final class MeetingSession {
 
             summaryActivity = .summarizing
             do {
-                if let topic = try await summarizer.update(with: transcript.finalLines) {
+                if let topic = try await summarizer.update(with: transcript.lines) {
                     currentTopic = topic
                     summaryFailure = nil
                 }

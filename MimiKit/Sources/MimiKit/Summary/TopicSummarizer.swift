@@ -1,51 +1,28 @@
 import Foundation
 
-/// Summarizes the topic currently being discussed from the most recent final lines.
+/// Summarizes the topic currently being discussed from the most recent lines, including those still in progress.
 public actor TopicSummarizer {
-    static let instructions = """
-        あなたは会議の内容を整理するアシスタントです。
-        入力は音声認識による文字起こしで、「\(Speaker.me.displayName)」はこのアプリの利用者、「\(Speaker.others.displayName)」はそれ以外の参加者の発言です。
-        文字起こしには誤認識が含まれることがあるため、文脈から意図を補って解釈してください。
-        出力は日本語の要約本文のみとし、前置きや見出しは書かないでください。
-        """
-
     private let generator: any TextGenerator
     private let recentCharacterLimit: Int
-    private var summarizedLineIDs: Set<UUID> = []
+    /// The prompt of the last summary, which needs no update while the prompt stays the same.
+    private var lastPrompt: String?
 
+    /// `recentCharacterLimit` bounds the text of the lines the summary reads. Must be positive.
     public init(generator: any TextGenerator, recentCharacterLimit: Int = 1500) {
+        precondition(recentCharacterLimit > 0, "The recent character limit must be positive")
         self.generator = generator
         self.recentCharacterLimit = recentCharacterLimit
     }
 
-    /// Returns `nil` when no final lines have been added since the last summary.
-    public func update(with finalLines: [Transcript.Line]) async throws -> String? {
-        let newLineIDs = Set(finalLines.map(\.id)).subtracting(summarizedLineIDs)
-        guard !newLineIDs.isEmpty else { return nil }
+    /// Returns `nil` when there are no lines, or when the recent lines read the same as for the last summary.
+    public func update(with lines: [Transcript.Line]) async throws -> String? {
+        let excerpt = TranscriptExcerpt(of: lines, characterLimit: recentCharacterLimit)
+        guard !excerpt.lines.isEmpty else { return nil }
+        let prompt = TopicSummaryPrompt.prompt(for: excerpt)
+        guard prompt != lastPrompt else { return nil }
 
-        let summary = try await generator.generate(
-            instructions: Self.instructions,
-            prompt: """
-                直近の発言:
-                \(Self.format(recentLines(of: finalLines)))
-
-                今話されている話題を2〜3文で要約してください。
-                """
-        )
-        summarizedLineIDs.formUnion(newLineIDs)
+        let summary = try await generator.generate(instructions: TopicSummaryPrompt.instructions, prompt: prompt)
+        lastPrompt = prompt
         return summary.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    private func recentLines(of lines: [Transcript.Line]) -> [Transcript.Line] {
-        var characterCount = 0
-        let recent = lines.reversed().prefix { line in
-            characterCount += line.text.count
-            return characterCount <= recentCharacterLimit
-        }
-        return recent.isEmpty ? Array(lines.suffix(1)) : recent.reversed()
-    }
-
-    static func format(_ lines: [Transcript.Line]) -> String {
-        lines.map { "\($0.speaker.displayName): \($0.text)" }.joined(separator: "\n")
     }
 }

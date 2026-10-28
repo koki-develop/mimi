@@ -725,6 +725,16 @@ struct MeetingSessionTests {
         #expect(harness.session.summaryActivity == .idle)
     }
 
+    @Test func summarizesSpeechInProgress() async throws {
+        let harness = Harness(summaryInterval: .milliseconds(10))
+        await harness.session.start(summaryModel: .qwen3_5_4B)
+        harness.createdEngines[1].emit(result("議題は予算で", 0, final: false))
+
+        try await waitUntil { !harness.session.currentTopic.isEmpty }
+        #expect(harness.session.currentTopic == "話題の要約")
+        await harness.session.stop()
+    }
+
     @Test func modelLoadingFailureKeepsTranscribing() async throws {
         let harness = Harness(provider: FakeGeneratorProvider(error: TestError()))
         await harness.session.start(summaryModel: .qwen3_5_4B)
