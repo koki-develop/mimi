@@ -1,31 +1,27 @@
 import AVFAudio
 import CoreAudio
-import Darwin
-import Foundation
 import OSLog
 
 /// Captures the mixed-down audio output of every process on the system via a Core Audio process tap.
-/// The tap runs on an aggregate device clocked by the default system output device, so the tap is
-/// rebuilt whenever that device changes.
+///
+/// The tap is read through a private aggregate device holding only the tap. The tap covers every output device, so
+/// it keeps capturing when the output device changes.
 public final class SystemAudioCapture: AudioSource {
-    private static let logger = Logger(subsystem: "MimiKit", category: "SystemAudioCapture")
-
-    private struct Run {
-        let onBuffer: AudioBufferHandler
-        let onFailure: (any Error) -> Void
-        let defaultDeviceObserver: AudioPropertyObserver
+    // Capture that could not be set up is retried when the output changes, which is when the tap is reconfigured.
+    private let capture = DeviceFollowingCapture(
+        label: "SystemAudioCapture",
+        systemProperties: [
+            AudioProperty(object: .system, selector: kAudioHardwarePropertyDefaultOutputDevice),
+            AudioProperty(object: .system, selector: kAudioHardwarePropertyDefaultSystemOutputDevice),
+        ]
+    ) { onBuffer in
+        try SystemAudioBinding(onBuffer: onBuffer)
     }
-
-    private var run: Run?
-    private var tapID = AudioObjectID.unknown
-    private var aggregateDeviceID = AudioObjectID.unknown
-    private var ioProcID: AudioDeviceIOProcID?
-    private let queue = DispatchQueue(label: "SystemAudioCapture", qos: .userInitiated)
 
     public init() {}
 
     isolated deinit {
-        stop()
+        capture.stopInBackground()
     }
 
     /// Core Audio has no API to request or check the system audio recording permission.
@@ -34,69 +30,47 @@ public final class SystemAudioCapture: AudioSource {
         true
     }
 
-    public func start(onBuffer: @escaping AudioBufferHandler, onFailure: @escaping (any Error) -> Void) throws {
-        stop()
-        let defaultDeviceObserver = AudioPropertyObserver(selector: kAudioHardwarePropertyDefaultSystemOutputDevice)
-        run = Run(onBuffer: onBuffer, onFailure: onFailure, defaultDeviceObserver: defaultDeviceObserver)
+    public func start(onBuffer: @escaping AudioBufferHandler, onAvailabilityChange: @escaping @MainActor (AudioSourceAvailability) -> Void) {
+        capture.start(onBuffer: onBuffer, onAvailabilityChange: onAvailabilityChange)
+    }
+
+    public func stop() async {
+        await capture.stop()
+    }
+}
+
+/// A process tap and the aggregate device it is read through.
+private final class SystemAudioBinding: CaptureBinding {
+    private static let logger = Logger(subsystem: "MimiKit", category: "SystemAudioCapture")
+
+    private var tapID = AudioObjectID.unknown
+    private var tapFormat = AudioStreamBasicDescription()
+    private var aggregateDeviceID = AudioObjectID.unknown
+    private var input: AudioDeviceInput?
+
+    init(onBuffer: @escaping AudioBufferHandler) throws(AudioCaptureError) {
         do {
-            try defaultDeviceObserver.start { [weak self] in self?.restart() }
-            try startTap()
+            try setUp(onBuffer: onBuffer)
         } catch {
             stop()
             throw error
         }
     }
 
-    public func stop() {
-        stopTap()
-        run?.defaultDeviceObserver.stop()
-        run = nil
-    }
-
-    private func restart() {
-        guard let run else { return }
-        stopTap()
-        do {
-            try startTap()
-        } catch {
-            stop()
-            run.onFailure(error)
-        }
-    }
-
-    private func startTap() throws(AudioCaptureError) {
-        guard let onBuffer = run?.onBuffer else { return }
-        do {
-            try createTap(onBuffer: onBuffer)
-        } catch {
-            stopTap()
-            throw error
-        }
-    }
-
-    private func createTap(onBuffer: @escaping AudioBufferHandler) throws(AudioCaptureError) {
+    private func setUp(onBuffer: @escaping AudioBufferHandler) throws(AudioCaptureError) {
         let tapDescription = CATapDescription(monoGlobalTapButExcludeProcesses: [])
         tapDescription.uuid = UUID()
         tapDescription.isPrivate = true
         tapDescription.muteBehavior = .unmuted
         try check(AudioHardwareCreateProcessTap(tapDescription, &tapID), "AudioHardwareCreateProcessTap")
+        tapFormat = try tapID.readTapFormat()
 
-        var streamDescription = try tapID.readTapFormat()
-        guard let format = AVAudioFormat(streamDescription: &streamDescription) else {
-            throw .unsupportedFormat
-        }
-
-        let outputUID = try AudioObjectID.readDefaultSystemOutputDevice().readDeviceUID()
         let aggregateDescription: [String: Any] = [
             kAudioAggregateDeviceNameKey: "Mimi System Audio Tap",
             kAudioAggregateDeviceUIDKey: UUID().uuidString,
-            kAudioAggregateDeviceMainSubDeviceKey: outputUID,
             kAudioAggregateDeviceIsPrivateKey: true,
             kAudioAggregateDeviceIsStackedKey: false,
-            kAudioAggregateDeviceTapAutoStartKey: true,
-            kAudioAggregateDeviceSubDeviceListKey: [
-                [kAudioSubDeviceUIDKey: outputUID],
-            ],
+            kAudioAggregateDeviceTapAutoStartKey: false,
             kAudioAggregateDeviceTapListKey: [
                 [
                     kAudioSubTapDriftCompensationKey: true,
@@ -109,27 +83,24 @@ public final class SystemAudioCapture: AudioSource {
             "AudioHardwareCreateAggregateDevice"
         )
 
-        // `@Sendable` keeps the block from inheriting main actor isolation; it runs on `queue`.
-        try check(
-            AudioDeviceCreateIOProcIDWithBlock(&ioProcID, aggregateDeviceID, queue) { @Sendable _, inputData, inputTime, _, _ in
-                guard let buffer = AVAudioPCMBuffer(pcmFormat: format, bufferListNoCopy: inputData, deallocator: nil) else {
-                    return
-                }
-                let timestamp = inputTime.pointee
-                onBuffer(buffer, timestamp.mFlags.contains(.hostTimeValid) ? timestamp.mHostTime : mach_absolute_time())
-            },
-            "AudioDeviceCreateIOProcIDWithBlock"
-        )
-        try check(AudioDeviceStart(aggregateDeviceID, ioProcID), "AudioDeviceStart")
+        let input = try AudioDeviceInput(device: aggregateDeviceID, label: "SystemAudioCapture.input")
+        self.input = input
+        try input.start(onBuffer: onBuffer)
     }
 
-    private func stopTap() {
+    var observedProperties: [AudioProperty] {
+        [AudioProperty(object: tapID, selector: kAudioTapPropertyFormat)] + (input?.observedProperties ?? [])
+    }
+
+    func isCurrent() -> Bool {
+        guard let input, input.isCurrent() else { return false }
+        return (try? tapID.readTapFormat())?.matches(tapFormat) == true
+    }
+
+    func stop() {
+        input?.stop()
+        input = nil
         if aggregateDeviceID.isValid {
-            log(AudioDeviceStop(aggregateDeviceID, ioProcID), "AudioDeviceStop")
-            if let ioProcID {
-                log(AudioDeviceDestroyIOProcID(aggregateDeviceID, ioProcID), "AudioDeviceDestroyIOProcID")
-                self.ioProcID = nil
-            }
             log(AudioHardwareDestroyAggregateDevice(aggregateDeviceID), "AudioHardwareDestroyAggregateDevice")
             aggregateDeviceID = .unknown
         }

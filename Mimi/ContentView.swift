@@ -71,7 +71,8 @@ struct ContentView: View {
     }
 }
 
-/// The failure, the missing summary model, the current topic, and the rule that separates them from the transcript.
+/// The failure, audio that cannot be captured, the missing summary model, the current topic, and the rule that
+/// separates them from the transcript.
 private struct HeaderView: View {
     let session: MeetingSession
     let summaryModels: SummaryModelStore
@@ -83,6 +84,13 @@ private struct HeaderView: View {
                 FailureBanner(failure: failure)
                     .padding(.horizontal, 12)
                     .padding(.top, 4)
+            }
+            ForEach([Speaker.me, .others], id: \.self) { speaker in
+                if let error = session.captureError(of: speaker) {
+                    Banner(tone: .warning, message: "\(speaker.displayName)の音声を取得できていません", detail: error.localizedDescription)
+                        .padding(.horizontal, 12)
+                        .padding(.top, 4)
+                }
             }
             if session.state == .idle, summaryModels.selectedModel == nil {
                 SummaryModelRequiredBanner()
@@ -553,7 +561,6 @@ private extension MeetingSession.Failure {
     var message: String {
         switch self {
         case .microphoneAccessDenied: "マイクへのアクセスが許可されていません"
-        case .audioCapture: "音声を取得できませんでした"
         case .transcription: "文字起こしに失敗しました"
         }
     }
@@ -561,7 +568,7 @@ private extension MeetingSession.Failure {
     var detail: String? {
         switch self {
         case .microphoneAccessDenied: nil
-        case let .audioCapture(error), let .transcription(error): error.localizedDescription
+        case let .transcription(error): error.localizedDescription
         }
     }
 }

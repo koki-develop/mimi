@@ -8,7 +8,8 @@ private struct TestError: Error {}
 @MainActor
 private final class FakeAudioSource: AudioSource {
     var isAccessGranted = true
-    var startError: (any Error)?
+    /// Reported once started, as by a source that has no device to capture from.
+    var availabilityOnStart: AudioSourceAvailability?
     private(set) var isRunning = false
     private(set) var startCount = 0
     private(set) var accessRequestCount = 0
@@ -32,24 +33,22 @@ private final class FakeAudioSource: AudioSource {
     }
 
     private var onBuffer: AudioBufferHandler?
-    private var onFailure: ((any Error) -> Void)?
+    private var onAvailabilityChange: (@MainActor (AudioSourceAvailability) -> Void)?
 
-    /// Called once the source has started.
-    var onStart: () -> Void = {}
-
-    func start(onBuffer: @escaping AudioBufferHandler, onFailure: @escaping (any Error) -> Void) throws {
+    func start(onBuffer: @escaping AudioBufferHandler, onAvailabilityChange: @escaping @MainActor (AudioSourceAvailability) -> Void) {
         startCount += 1
-        if let startError { throw startError }
         isRunning = true
         self.onBuffer = onBuffer
-        self.onFailure = onFailure
-        onStart()
+        self.onAvailabilityChange = onAvailabilityChange
+        if let availabilityOnStart {
+            onAvailabilityChange(availabilityOnStart)
+        }
     }
 
-    func stop() {
+    func stop() async {
         isRunning = false
         onBuffer = nil
-        onFailure = nil
+        onAvailabilityChange = nil
     }
 
     /// Delivers captured audio as the running source would.
@@ -57,11 +56,9 @@ private final class FakeAudioSource: AudioSource {
         onBuffer?(buffer, hostTime)
     }
 
-    /// Simulates capture stopping unexpectedly, e.g. when the device cannot be resumed after a change.
-    func fail() {
-        let onFailure = onFailure
-        stop()
-        onFailure?(TestError())
+    /// Simulates capture stopping or resuming as the devices change.
+    func report(_ availability: AudioSourceAvailability) {
+        onAvailabilityChange?(availability)
     }
 }
 
@@ -407,30 +404,31 @@ struct MeetingSessionTests {
         }
     }
 
-    @Test func captureErrorTearsDownStartedComponents() async {
+    @Test func unavailableSourceAtStartKeepsSessionRunning() async {
         let harness = Harness()
-        harness.systemAudio.startError = TestError()
+        harness.systemAudio.availabilityOnStart = .unavailable(TestError())
         await harness.session.start(summaryModel: .qwen3_5_4B)
 
-        #expect(harness.session.state == .idle)
-        #expect(!harness.microphone.isRunning)
-        #expect(harness.createdEngines.map(\.isFinished) == [true, true])
-        guard case .audioCapture = harness.session.failure else {
-            Issue.record("Unexpected failure: \(String(describing: harness.session.failure))")
-            return
-        }
+        #expect(harness.session.state == .running)
+        #expect(harness.session.failure == nil)
+        #expect(harness.session.captureError(of: .others) != nil)
+        #expect(harness.session.captureError(of: .me) == nil)
+        #expect(harness.microphone.isRunning)
+
+        await harness.session.stop()
+        #expect(harness.session.captureError(of: .others) == nil)
     }
 
     @Test func failureWhileStartingKeepsRootCause() async {
         let harness = Harness()
-        // The microphone fails, then the system audio's engine fails to start.
-        harness.microphone.onStart = { harness.microphone.fail() }
+        // Microphone access is denied, then the system audio's engine fails to start.
+        harness.microphone.isAccessGranted = false
         harness.engineFactory.failingStartIndexes = [1]
         await harness.session.start(summaryModel: .qwen3_5_4B)
 
         #expect(harness.session.state == .idle)
         #expect(harness.createdEngines.map(\.isFinished) == [true, true])
-        guard case .audioCapture = harness.session.failure else {
+        guard case .microphoneAccessDenied = harness.session.failure else {
             Issue.record("Unexpected failure: \(String(describing: harness.session.failure))")
             return
         }
@@ -438,15 +436,16 @@ struct MeetingSessionTests {
 
     @Test func failureWhileStartingSkipsSummary() async {
         let harness = Harness()
-        // The microphone fails while the system audio is still starting, which then succeeds.
-        harness.microphone.onStart = { harness.microphone.fail() }
+        // The system audio's engine fails to start after the microphone started.
+        harness.engineFactory.failingStartIndexes = [1]
         await harness.session.start(summaryModel: .qwen3_5_4B)
 
         #expect(harness.session.state == .idle)
+        #expect(!harness.microphone.isRunning)
         #expect(!harness.systemAudio.isRunning)
         #expect(harness.createdEngines.map(\.isFinished) == [true, true])
         #expect(harness.provider.requestCount == 0)
-        guard case .audioCapture = harness.session.failure else {
+        guard case .transcription = harness.session.failure else {
             Issue.record("Unexpected failure: \(String(describing: harness.session.failure))")
             return
         }
@@ -465,18 +464,81 @@ struct MeetingSessionTests {
         }
     }
 
-    @Test func captureFailureWhileRunningStopsSession() async throws {
+    @Test func systemAudioUnavailableWhileRunningKeepsSessionUntilItResumes() async throws {
         let harness = Harness()
         await harness.session.start(summaryModel: .qwen3_5_4B)
-        harness.systemAudio.fail()
+        harness.systemAudio.report(.unavailable(TestError()))
 
-        try await waitUntil { harness.session.state == .idle }
-        #expect(!harness.microphone.isRunning)
-        #expect(harness.createdEngines.map(\.isFinished) == [true, true])
-        guard case .audioCapture = harness.session.failure else {
-            Issue.record("Unexpected failure: \(String(describing: harness.session.failure))")
-            return
-        }
+        #expect(harness.session.state == .running)
+        #expect(harness.session.captureError(of: .others) != nil)
+        #expect(harness.microphone.isRunning)
+        // The speech captured before is finalized, as the input pauses.
+        try await waitUntil { harness.createdEngines[1].finalizePendingCount == 1 }
+        #expect(harness.createdEngines[0].finalizePendingCount == 0)
+
+        harness.systemAudio.report(.available)
+        #expect(harness.session.captureError(of: .others) == nil)
+        #expect(harness.session.failure == nil)
+        await harness.session.stop()
+    }
+
+    @Test func microphoneUnavailableDeliversHeldAudioAndFinalizes() async throws {
+        let harness = Harness()
+        await harness.session.start(summaryModel: .qwen3_5_4B)
+        harness.microphone.capture(makeBuffer([Float](repeating: 0.1, count: 1600)), hostTime: hostTime(10))
+        #expect(harness.createdEngines[0].events.isEmpty)
+
+        harness.microphone.report(.unavailable(TestError()))
+        #expect(harness.session.state == .running)
+        #expect(harness.session.captureError(of: .me) != nil)
+        #expect(harness.createdEngines[0].appendedFrameCount == 1600)
+        try await waitUntil { harness.createdEngines[0].finalizePendingCount == 1 }
+        #expect(harness.createdEngines[0].events.last == .finalizePending)
+
+        harness.microphone.report(.available)
+        #expect(harness.session.captureError(of: .me) == nil)
+        #expect(harness.microphone.isRunning)
+        await harness.session.stop()
+    }
+
+    @Test func repeatedUnavailabilityFinalizesOnceAndKeepsTheLatestReason() async throws {
+        struct FirstReason: Error {}
+        struct SecondReason: Error {}
+        let harness = Harness()
+        await harness.session.start(summaryModel: .qwen3_5_4B)
+        harness.microphone.report(.unavailable(FirstReason()))
+        harness.systemAudio.report(.unavailable(FirstReason()))
+        harness.microphone.report(.unavailable(SecondReason()))
+        harness.systemAudio.report(.unavailable(SecondReason()))
+
+        #expect(harness.session.captureError(of: .me) is SecondReason)
+        #expect(harness.session.captureError(of: .others) is SecondReason)
+        try await waitUntil { harness.createdEngines.map(\.finalizePendingCount) == [1, 1] }
+        // Muting runs after any finalization scheduled before it, and finalizes once more itself.
+        await harness.session.setMicrophoneMuted(true).value
+        #expect(harness.createdEngines[0].finalizePendingCount == 2)
+        #expect(harness.createdEngines[1].finalizePendingCount == 1)
+
+        // Becoming unavailable again after resuming is another pause.
+        harness.systemAudio.report(.available)
+        harness.systemAudio.report(.unavailable(FirstReason()))
+        try await waitUntil { harness.createdEngines[1].finalizePendingCount == 2 }
+        await harness.session.stop()
+    }
+
+    @Test func mutingClearsMicrophoneCaptureError() async {
+        let harness = Harness()
+        await harness.session.start(summaryModel: .qwen3_5_4B)
+        harness.microphone.report(.unavailable(TestError()))
+        #expect(harness.session.captureError(of: .me) != nil)
+
+        await harness.session.setMicrophoneMuted(true).value
+        #expect(harness.session.captureError(of: .me) == nil)
+
+        await harness.session.setMicrophoneMuted(false).value
+        #expect(harness.session.captureError(of: .me) == nil)
+        #expect(harness.microphone.isRunning)
+        await harness.session.stop()
     }
 
     @Test func mutingStopsMicrophoneAndFinalizesItsSpeech() async {
@@ -616,21 +678,20 @@ struct MeetingSessionTests {
         await harness.session.stop()
     }
 
-    @Test func unmuteFailureStopsSession() async {
+    @Test func microphoneUnavailableAfterUnmuteKeepsSession() async {
         let harness = Harness()
         await harness.session.start(summaryModel: .qwen3_5_4B)
         await harness.session.setMicrophoneMuted(true).value
 
-        harness.microphone.startError = TestError()
+        harness.microphone.availabilityOnStart = .unavailable(TestError())
         await harness.session.setMicrophoneMuted(false).value
-        await harness.session.stop()
 
-        #expect(harness.session.state == .idle)
-        #expect(!harness.systemAudio.isRunning)
-        guard case .audioCapture = harness.session.failure else {
-            Issue.record("Unexpected failure: \(String(describing: harness.session.failure))")
-            return
-        }
+        #expect(harness.session.state == .running)
+        #expect(harness.session.failure == nil)
+        #expect(harness.session.captureError(of: .me) != nil)
+        #expect(harness.systemAudio.isRunning)
+        await harness.session.stop()
+        #expect(harness.session.captureError(of: .me) == nil)
     }
 
     @Test func resultsAreAttributedToTheirSpeakers() async throws {
@@ -691,7 +752,7 @@ struct MeetingSessionTests {
 
     @Test func summaryModelIsReleasedWhenStartFails() async {
         let harness = Harness()
-        harness.systemAudio.startError = TestError()
+        harness.engineFactory.failingStartIndexes = [1]
         await harness.session.start(summaryModel: .qwen3_5_4B)
 
         #expect(harness.session.state == .idle)
@@ -701,7 +762,7 @@ struct MeetingSessionTests {
     @Test func summaryModelIsReleasedWhenSessionStopsUnexpectedly() async throws {
         let harness = Harness()
         await harness.session.start(summaryModel: .qwen3_5_4B)
-        harness.systemAudio.fail()
+        harness.createdEngines[1].fail()
 
         try await waitUntil { harness.session.state == .idle }
         #expect(harness.summaryModels.useCounts[.qwen3_5_4B] == 0)
@@ -726,11 +787,11 @@ struct MeetingSessionTests {
 
     @Test func restartClearsPreviousSession() async throws {
         let harness = Harness()
-        harness.systemAudio.startError = TestError()
+        // Engines are counted across sessions, so only the first session's system audio engine fails.
+        harness.engineFactory.failingStartIndexes = [1]
         await harness.session.start(summaryModel: .qwen3_5_4B)
         #expect(harness.session.failure != nil)
 
-        harness.systemAudio.startError = nil
         await harness.session.start(summaryModel: .qwen3_5_4B)
         #expect(harness.session.state == .running)
         #expect(harness.session.failure == nil)
@@ -771,33 +832,45 @@ struct MeetingSessionTests {
         await harness.session.stop()
     }
 
-    @Test func echoCancellationFailureStopsSession() async throws {
+    @Test func echoCancellationFailureStopsOnlyTheMicrophone() async throws {
         let harness = Harness()
         harness.echoCancellerFactory.processingError = TestError()
         await harness.session.start(summaryModel: .qwen3_5_4B)
         harness.microphone.capture(makeBuffer([Float](repeating: 0.1, count: 8000)), hostTime: hostTime(10))
 
-        try await waitUntil { harness.session.state == .idle }
+        try await waitUntil { !harness.microphone.isRunning }
+        #expect(harness.session.state == .running)
+        #expect(harness.session.failure == nil)
+        #expect(harness.session.captureError(of: .me) != nil)
+        #expect(harness.systemAudio.isRunning)
+        try await waitUntil { harness.createdEngines[0].finalizePendingCount == 1 }
+
+        // Muted audio is not expected to be captured, so there is nothing to report.
+        await harness.session.setMicrophoneMuted(true).value
+        #expect(harness.session.captureError(of: .me) == nil)
+
+        // The microphone stays off for the rest of the session.
+        await harness.session.setMicrophoneMuted(false).value
         #expect(!harness.microphone.isRunning)
-        #expect(harness.createdEngines.map(\.isFinished) == [true, true])
-        guard case .audioCapture = harness.session.failure else {
-            Issue.record("Unexpected failure: \(String(describing: harness.session.failure))")
-            return
-        }
+        #expect(harness.microphone.startCount == 1)
+        #expect(harness.session.captureError(of: .me) != nil)
+
+        await harness.session.stop()
+        #expect(harness.session.captureError(of: .me) == nil)
     }
 
-    @Test func echoCancellerFailureFailsStart() async {
+    @Test func echoCancellerCreationFailureRunsWithoutMicrophone() async {
         let harness = Harness()
         harness.echoCancellerFactory.error = TestError()
         await harness.session.start(summaryModel: .qwen3_5_4B)
 
-        #expect(harness.session.state == .idle)
-        #expect(!harness.microphone.isRunning)
-        #expect(!harness.systemAudio.isRunning)
-        #expect(harness.createdEngines.map(\.isFinished) == [true])
-        guard case .audioCapture = harness.session.failure else {
-            Issue.record("Unexpected failure: \(String(describing: harness.session.failure))")
-            return
-        }
+        #expect(harness.session.state == .running)
+        #expect(harness.session.failure == nil)
+        #expect(harness.session.captureError(of: .me) != nil)
+        #expect(harness.microphone.startCount == 0)
+        #expect(harness.systemAudio.isRunning)
+
+        await harness.session.stop()
+        #expect(harness.createdEngines.map(\.isFinished) == [true, true])
     }
 }

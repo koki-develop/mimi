@@ -15,7 +15,6 @@ public final class MeetingSession {
 
     public enum Failure: Error {
         case microphoneAccessDenied
-        case audioCapture(any Error)
         case transcription(any Error)
     }
 
@@ -48,6 +47,12 @@ public final class MeetingSession {
     public private(set) var summaryFailure: SummaryFailure?
     /// Whether the microphone is excluded from capture. Applies to the current and later sessions.
     public private(set) var isMicrophoneMuted = false
+    /// Why the microphone cannot capture at the moment, while it is supposed to.
+    private var microphoneSourceError: (any Error)?
+    /// Why the system audio cannot be captured at the moment.
+    private var systemAudioSourceError: (any Error)?
+    /// Why the microphone audio cannot be processed for the rest of the session.
+    private var echoCancellationError: (any Error)?
 
     public let microphoneLevel = AudioLevelMeter()
     public let systemAudioLevel = AudioLevelMeter()
@@ -65,7 +70,10 @@ public final class MeetingSession {
     @ObservationIgnored private var engines: [any TranscriptionEngine] = []
     @ObservationIgnored private var microphonePath: MicrophonePath?
     @ObservationIgnored private var isMicrophoneCapturing = false
-    @ObservationIgnored private var microphoneReconciliation: Task<Void, Never>?
+    /// Starts, stops, and finalizes the microphone audio in call order.
+    @ObservationIgnored private var microphoneTasks = SerialTasks()
+    /// Finalizes the system audio in call order.
+    @ObservationIgnored private var systemAudioTasks = SerialTasks()
     @ObservationIgnored private var resultTasks: [Task<Void, Never>] = []
     @ObservationIgnored private var summaryTask: Task<Void, Never>?
     /// The model borrowed from ``summaryModels`` until the session is torn down.
@@ -99,6 +107,9 @@ public final class MeetingSession {
         currentTopic = ""
         failure = nil
         summaryFailure = nil
+        microphoneSourceError = nil
+        systemAudioSourceError = nil
+        echoCancellationError = nil
 
         let summaryModelDirectory: URL?
         do {
@@ -132,6 +143,15 @@ public final class MeetingSession {
         return reconcileMicrophone()
     }
 
+    /// Why the audio of `speaker` is not being captured, while the session is active and the audio is not muted. When
+    /// the reason is the audio device, capture resumes on its own once the devices change, and this returns `nil` again.
+    public func captureError(of speaker: Speaker) -> (any Error)? {
+        switch speaker {
+        case .me: isMicrophoneMuted ? nil : echoCancellationError ?? microphoneSourceError
+        case .others: systemAudioSourceError
+        }
+    }
+
     private func stopRunning() async {
         if let stopTask {
             await stopTask.value
@@ -155,7 +175,7 @@ public final class MeetingSession {
         } catch {
             record(error)
         }
-        // Also covers a source or engine that failed asynchronously while the other one was still starting.
+        // Also covers an engine that failed, or microphone access denied, while the rest was still starting.
         guard failure == nil else {
             // Ends capture being active, so that nothing restarts the microphone while the session is torn down.
             state = .stopping
@@ -174,28 +194,34 @@ public final class MeetingSession {
     private func startCapture() async throws(Failure) {
         let timelineOrigin = mach_absolute_time()
 
-        let microphonePath = try makeMicrophonePath(feeding: try await startEngine(for: .me, timelineOrigin: timelineOrigin))
-        self.microphonePath = microphonePath
-        // Starts the microphone unless muted. Failures are recorded and checked by `performStart`.
+        microphonePath = makeMicrophonePath(feeding: try await startEngine(for: .me, timelineOrigin: timelineOrigin))
+        // Starts the microphone unless muted. Denied access is recorded and checked by `performStart`.
         await reconcileMicrophone().value
 
         let systemAudioEngine = try await startEngine(for: .others, timelineOrigin: timelineOrigin)
         let meter = systemAudioLevel
-        let echoCancellation = microphonePath.echoCancellation
-        try start(systemAudio) { @Sendable buffer, hostTime in
-            systemAudioEngine.append(buffer, hostTime: hostTime)
-            meter.update(with: buffer)
-            echoCancellation.appendReference(buffer, hostTime: hostTime)
-        }
+        let echoCancellation = microphonePath?.echoCancellation
+        systemAudio.start(
+            onBuffer: { @Sendable buffer, hostTime in
+                systemAudioEngine.append(buffer, hostTime: hostTime)
+                meter.update(with: buffer)
+                echoCancellation?.appendReference(buffer, hostTime: hostTime)
+            },
+            onAvailabilityChange: { [weak self] availability in
+                self?.systemAudioAvailabilityChanged(availability, engine: systemAudioEngine)
+            }
+        )
     }
 
     /// The microphone audio reaches `engine` and ``microphoneLevel`` through the echo cancellation of the result.
-    private func makeMicrophonePath(feeding engine: any TranscriptionEngine) throws(Failure) -> MicrophonePath {
+    /// Returns `nil` when there is no echo cancellation for the microphone audio, which is then not captured.
+    private func makeMicrophonePath(feeding engine: any TranscriptionEngine) -> MicrophonePath? {
         let canceller: any EchoCanceller
         do {
             canceller = try makeEchoCanceller(EchoCancellationPipeline.sampleRate)
         } catch {
-            throw .audioCapture(error)
+            echoCancellationError = error
+            return nil
         }
         let meter = microphoneLevel
         let echoCancellation = EchoCancellationPipeline(
@@ -205,10 +231,17 @@ public final class MeetingSession {
                 meter.update(with: buffer)
             },
             onFailure: { [weak self] error in
-                Task { @MainActor in self?.fail(.audioCapture(error)) }
+                Task { @MainActor in self?.echoCancellationFailed(error, engine: engine) }
             }
         )
         return MicrophonePath(engine: engine, echoCancellation: echoCancellation)
+    }
+
+    /// Stops capturing the microphone for the rest of the session, since its audio can no longer be processed.
+    private func echoCancellationFailed(_ error: any Error, engine: any TranscriptionEngine) {
+        guard isCaptureActive, microphonePath?.engine === engine else { return }
+        echoCancellationError = error
+        reconcileMicrophone()
     }
 
     private func startEngine(for speaker: Speaker, timelineOrigin: UInt64) async throws(Failure) -> any TranscriptionEngine {
@@ -223,39 +256,28 @@ public final class MeetingSession {
     }
 
     /// Delivers the microphone audio still held for echo cancellation, so that the engine can finalize it.
-    private func stopMicrophone() {
-        microphone.stop()
-        microphonePath?.echoCancellation.flush()
+    private func stopMicrophone() async {
         isMicrophoneCapturing = false
+        microphoneSourceError = nil
+        await microphone.stop()
+        microphonePath?.echoCancellation.flush()
         microphoneLevel.reset()
     }
 
-    private func start(_ source: any AudioSource, onBuffer: @escaping AudioBufferHandler) throws(Failure) {
-        do {
-            try source.start(onBuffer: onBuffer, onFailure: { [weak self] error in self?.fail(.audioCapture(error)) })
-        } catch {
-            throw .audioCapture(error)
-        }
-    }
-
-    /// Schedules bringing microphone capture in line with ``isMicrophoneMuted``. This is the only path that
-    /// starts or stops the microphone while a session is active, and runs one at a time in call order.
+    /// Schedules bringing microphone capture in line with ``isMicrophoneMuted`` and the echo cancellation. This is
+    /// the only path that starts or stops the microphone while a session is active, and runs in call order.
+    @discardableResult
     private func reconcileMicrophone() -> Task<Void, Never> {
-        let previous = microphoneReconciliation
-        let task = Task { [self] in
-            await previous?.value
-            await applyMicrophoneMute()
-        }
-        microphoneReconciliation = task
-        return task
+        microphoneTasks.enqueue { [self] in await applyMicrophoneMute() }
     }
 
     private func applyMicrophoneMute() async {
         guard isCaptureActive, let microphonePath else { return }
-        if isMicrophoneMuted, isMicrophoneCapturing {
-            stopMicrophone()
+        let shouldCapture = !isMicrophoneMuted && echoCancellationError == nil
+        if !shouldCapture, isMicrophoneCapturing {
+            await stopMicrophone()
             await microphonePath.engine.finalizePending()
-        } else if !isMicrophoneMuted, !isMicrophoneCapturing {
+        } else if shouldCapture, !isMicrophoneCapturing {
             let isAccessGranted = await microphone.requestAccess()
             // The session may have stopped, or a new one started, while access was being requested.
             guard isCaptureActive, self.microphonePath?.engine === microphonePath.engine else { return }
@@ -264,16 +286,50 @@ public final class MeetingSession {
                 return
             }
             // Muting while access was being requested takes precedence.
-            guard !isMicrophoneMuted else { return }
-            do {
-                let echoCancellation = microphonePath.echoCancellation
-                try start(microphone) { @Sendable buffer, hostTime in
+            guard !isMicrophoneMuted, echoCancellationError == nil else { return }
+            isMicrophoneCapturing = true
+            let echoCancellation = microphonePath.echoCancellation
+            microphone.start(
+                onBuffer: { @Sendable buffer, hostTime in
                     echoCancellation.appendCapture(buffer, hostTime: hostTime)
+                },
+                onAvailabilityChange: { [weak self] availability in
+                    self?.microphoneAvailabilityChanged(availability, path: microphonePath)
                 }
-                isMicrophoneCapturing = true
-            } catch {
-                fail(error)
-            }
+            )
+        }
+    }
+
+    /// When the microphone stops capturing, the speech captured before is finalized, as when muting. Further reports
+    /// while it cannot capture only update the reason.
+    private func microphoneAvailabilityChanged(_ availability: AudioSourceAvailability, path: MicrophonePath) {
+        guard isCaptureActive, isMicrophoneCapturing, microphonePath?.engine === path.engine else { return }
+        switch availability {
+        case .available:
+            microphoneSourceError = nil
+        case let .unavailable(error):
+            let wasCapturing = microphoneSourceError == nil
+            microphoneSourceError = error
+            guard wasCapturing else { return }
+            path.echoCancellation.flush()
+            microphoneLevel.reset()
+            microphoneTasks.enqueue { await path.engine.finalizePending() }
+        }
+    }
+
+    /// When the system audio stops being captured, the speech captured before is finalized. Further reports while it
+    /// cannot be captured only update the reason.
+    private func systemAudioAvailabilityChanged(_ availability: AudioSourceAvailability, engine: any TranscriptionEngine) {
+        guard isCaptureActive, engines.contains(where: { $0 === engine }) else { return }
+        switch availability {
+        case .available:
+            systemAudioSourceError = nil
+        case let .unavailable(error):
+            let wasCapturing = systemAudioSourceError == nil
+            systemAudioSourceError = error
+            guard wasCapturing else { return }
+            systemAudioLevel.reset()
+            systemAudioTasks.enqueue { await engine.finalizePending() }
         }
     }
 
@@ -310,8 +366,10 @@ public final class MeetingSession {
 
     private func tearDown() async {
         // Capture ends first so that it stops immediately, even while the summary task is still finishing.
-        stopMicrophone()
-        systemAudio.stop()
+        await stopMicrophone()
+        await systemAudio.stop()
+        systemAudioSourceError = nil
+        echoCancellationError = nil
         await withTaskGroup { group in
             for engine in engines {
                 group.addTask { await engine.finish() }
@@ -371,6 +429,24 @@ public final class MeetingSession {
             }
             summaryActivity = .idle
         }
+    }
+}
+
+/// Runs operations one at a time, in the order they are added.
+@MainActor
+private struct SerialTasks {
+    private var last: Task<Void, Never>?
+
+    /// - Returns: A task that completes once `operation` has run.
+    @discardableResult
+    mutating func enqueue(_ operation: @escaping @MainActor () async -> Void) -> Task<Void, Never> {
+        let previous = last
+        let task = Task { @MainActor in
+            await previous?.value
+            await operation()
+        }
+        last = task
+        return task
     }
 }
 

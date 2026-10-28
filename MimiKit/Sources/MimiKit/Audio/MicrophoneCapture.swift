@@ -1,108 +1,66 @@
 import AVFAudio
 import CoreAudio
-import Darwin
-import Foundation
 
 /// Captures audio from the default input device, following changes of the device while running.
+///
+/// Reads the device that is the default input when capture is set up, directly through an IOProc, so that capture set
+/// up right after the default input changes is on that device, and stays on it until it is replaced.
 public final class MicrophoneCapture: AudioSource {
-    private struct Run {
-        let onBuffer: AudioBufferHandler
-        let onFailure: (any Error) -> Void
-        let defaultDeviceObserver: AudioPropertyObserver
-        var engine: AVAudioEngine?
-        var configurationObserver: (any NSObjectProtocol)?
+    private let capture = DeviceFollowingCapture(
+        label: "MicrophoneCapture",
+        systemProperties: [
+            AudioProperty(object: .system, selector: kAudioHardwarePropertyDefaultInputDevice),
+            AudioProperty(object: .system, selector: kAudioHardwarePropertyDevices),
+        ]
+    ) { onBuffer in
+        try MicrophoneBinding(onBuffer: onBuffer)
     }
-
-    private var run: Run?
 
     public init() {}
 
     isolated deinit {
-        stop()
+        capture.stopInBackground()
     }
 
     public func requestAccess() async -> Bool {
         await AVAudioApplication.requestRecordPermission()
     }
 
-    public func start(onBuffer: @escaping AudioBufferHandler, onFailure: @escaping (any Error) -> Void) throws {
-        stop()
-        let defaultDeviceObserver = AudioPropertyObserver(selector: kAudioHardwarePropertyDefaultInputDevice)
-        run = Run(onBuffer: onBuffer, onFailure: onFailure, defaultDeviceObserver: defaultDeviceObserver)
+    public func start(onBuffer: @escaping AudioBufferHandler, onAvailabilityChange: @escaping @MainActor (AudioSourceAvailability) -> Void) {
+        capture.start(onBuffer: onBuffer, onAvailabilityChange: onAvailabilityChange)
+    }
+
+    public func stop() async {
+        await capture.stop()
+    }
+}
+
+/// Capture from the device that was the default input when it was set up.
+private final class MicrophoneBinding: CaptureBinding {
+    private let input: AudioDeviceInput
+
+    init(onBuffer: @escaping AudioBufferHandler) throws(AudioCaptureError) {
+        let device = try AudioObjectID.readDefaultInputDevice()
+        // The system has no default input for a moment while a device is removed.
+        guard device.isValid else { throw .inputDeviceUnavailable }
+        input = try AudioDeviceInput(device: device, label: "MicrophoneCapture.input")
         do {
-            try defaultDeviceObserver.start { [weak self] in self?.restart() }
-            try startEngine()
+            try input.start(onBuffer: onBuffer)
         } catch {
-            stop()
+            input.stop()
             throw error
         }
     }
 
-    public func stop() {
-        stopEngine()
-        run?.defaultDeviceObserver.stop()
-        run = nil
+    var observedProperties: [AudioProperty] {
+        input.observedProperties
     }
 
-    /// Starts a new engine, since an engine keeps using the input device it was started with.
-    private func startEngine() throws {
-        guard let onBuffer = run?.onBuffer else { return }
-        let engine = AVAudioEngine()
-        let input = engine.inputNode
-        // Installing a tap without an available input raises an exception instead of throwing.
-        let hardwareFormat = input.inputFormat(forBus: 0)
-        guard hardwareFormat.sampleRate > 0, hardwareFormat.channelCount > 0 else {
-            throw AudioCaptureError.inputDeviceUnavailable
-        }
-
-        // `@Sendable` keeps the block from inheriting main actor isolation; it runs on an audio thread.
-        input.installTap(onBus: 0, bufferSize: 4096, format: input.outputFormat(forBus: 0)) { @Sendable buffer, time in
-            onBuffer(buffer, time.isHostTimeValid ? time.hostTime : mach_absolute_time())
-        }
-        engine.prepare()
-        do {
-            try engine.start()
-        } catch {
-            input.removeTap(onBus: 0)
-            throw error
-        }
-
-        // The engine stops itself when the hardware format changes.
-        let engineID = ObjectIdentifier(engine)
-        run?.configurationObserver = NotificationCenter.default.addObserver(
-            forName: .AVAudioEngineConfigurationChange,
-            object: engine,
-            queue: .main
-        ) { [weak self] _ in
-            MainActor.assumeIsolated {
-                // Ignores notifications from an engine already replaced by a restart.
-                guard let self, let current = self.run?.engine, ObjectIdentifier(current) == engineID else { return }
-                self.restart()
-            }
-        }
-        run?.engine = engine
+    func isCurrent() -> Bool {
+        (try? AudioObjectID.readDefaultInputDevice()) == input.device && input.isCurrent()
     }
 
-    private func stopEngine() {
-        if let configurationObserver = run?.configurationObserver {
-            NotificationCenter.default.removeObserver(configurationObserver)
-            run?.configurationObserver = nil
-        }
-        if let engine = run?.engine {
-            engine.inputNode.removeTap(onBus: 0)
-            engine.stop()
-            run?.engine = nil
-        }
-    }
-
-    private func restart() {
-        guard let run else { return }
-        stopEngine()
-        do {
-            try startEngine()
-        } catch {
-            stop()
-            run.onFailure(error)
-        }
+    func stop() {
+        input.stop()
     }
 }
