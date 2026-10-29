@@ -1,0 +1,22 @@
+name: Setup
+description: Provide the CEchoCanceller XCFramework that MimiKit links, building it on a cache miss.
+
+runs:
+  using: composite
+  steps:
+    - id: cache
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: MimiKit/Native/EchoCanceller/build/CEchoCanceller.xcframework
+        key: echo-canceller-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('MimiKit/Native/EchoCanceller/build.sh', 'MimiKit/Native/EchoCanceller/echo_canceller.cc', 'MimiKit/Native/EchoCanceller/exported_symbols.txt', 'MimiKit/Native/EchoCanceller/include/**') }}
+
+    # Installs only the tools the build needs; meson comes from PyPI through uv.
+    - if: steps.cache.outputs.cache-hit != 'true'
+      uses: jdx/mise-action@6be3c7ed4c21d4f76b208d351d95aac273ebb76d # v5.2.4
+      with:
+        install_args: uv meson ninja
+
+    # Runs the task's script directly, since `mise run` would install every tool in mise.toml first.
+    - if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: MimiKit/Native/EchoCanceller/build.sh
